@@ -73,9 +73,8 @@ Result ch340_connect(Ch340Device *dev) {
     bool found = false;
     s32 limit = (found_count < 8) ? found_count : 8;
     for (s32 i = 0; i < limit; i++) {
-        UsbHsInterfaceInfo *info = (UsbHsInterfaceInfo*)interfaces[i].inf_priv;
-        if (!info || info->device_desc.idVendor != CH340_VID ||
-            info->device_desc.idProduct != CH340_PID) continue;
+        if (interfaces[i].device_desc.idVendor != CH340_VID ||
+            interfaces[i].device_desc.idProduct != CH340_PID) continue;
         rc = usbHsAcquireUsbIf(&dev->if_session, &interfaces[i]);
         if (R_SUCCEEDED(rc)) { found = true; break; }
     }
@@ -87,13 +86,11 @@ Result ch340_connect(Ch340Device *dev) {
     struct usb_endpoint_descriptor *out_desc = NULL;
     struct usb_endpoint_descriptor *in_desc  = NULL;
     for (s32 i = 0; i < limit; i++) {
-        UsbHsInterfaceInfo *info = (UsbHsInterfaceInfo*)interfaces[i].inf_priv;
-        if (!info) continue;
         for (int j = 0; j < 15; j++) {
-            if (info->output_endpoint_descs[j].bEndpointAddress != 0 && !out_desc)
-                out_desc = &info->output_endpoint_descs[j];
-            if (info->input_endpoint_descs[j].bEndpointAddress != 0 && !in_desc)
-                in_desc = &info->input_endpoint_descs[j];
+            if (interfaces[i].inf.output_endpoint_descs[j].bEndpointAddress != 0 && !out_desc)
+                out_desc = &interfaces[i].inf.output_endpoint_descs[j];
+            if (interfaces[i].inf.input_endpoint_descs[j].bEndpointAddress != 0 && !in_desc)
+                in_desc = &interfaces[i].inf.input_endpoint_descs[j];
         }
         if (out_desc && in_desc) break;
     }
