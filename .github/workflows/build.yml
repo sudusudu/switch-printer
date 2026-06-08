@@ -15,18 +15,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build NRO
+      - name: Setup and Build
         run: |
           export DEVKITPRO=/opt/devkitpro
           export PATH="$DEVKITPRO/devkitA64/bin:$DEVKITPRO/tools/bin:$PATH"
-          make -j$(nproc) 2>&1
+
+          echo "=== Tool Check ==="
+          which aarch64-none-elf-gcc
+          aarch64-none-elf-gcc --version | head -1
+          which nacptool
+          which elf2nro
+          echo "DEVKITPRO=$DEVKITPRO"
+          ls $DEVKITPRO/libnx/
+
+          echo "=== Building ==="
+          make -j$(nproc) V=1 2>&1
+
+          echo "=== Result ==="
           ls -la build/
 
-      - name: Upload NRO artifact
+      - uses: actions/upload-artifact@v4
         if: success()
-        uses: actions/upload-artifact@v4
         with:
           name: switch-printer-nro
-          path: |
-            build/switch_printer.nro
-            build/switch_printer.elf
+          path: build/switch_printer.nro
