@@ -1,9 +1,6 @@
 name: Build Switch Printer NRO
 
-on:
-  push:
-    branches: [main, master]
-  workflow_dispatch:
+on: [push, workflow_dispatch]
 
 jobs:
   build:
@@ -15,15 +12,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Dump USB struct
+        run: |
+          export DEVKITPRO=/opt/devkitpro
+          echo "=== UsbHsInterface ==="
+          cat $DEVKITPRO/libnx/include/switch/services/usbhs.h 2>/dev/null | head -200
+          echo "=== grep inf / pathstr / device ==="
+          grep -n "inf;\|pathstr\|device" $DEVKITPRO/libnx/include/switch/services/usbhs.h 2>/dev/null | head -30
+
       - name: Build
         run: |
           export DEVKITPRO=/opt/devkitpro
           export PATH="$DEVKITPRO/devkitA64/bin:$DEVKITPRO/tools/bin:$PATH"
-          make 2>&1
-          ls -la build/
-
-      - uses: actions/upload-artifact@v4
-        if: success()
-        with:
-          name: switch-printer-nro
-          path: build/switch_printer.nro
+          make 2>&1 | head -30
