@@ -14,6 +14,7 @@ static Thread g_print_thread;
 static Ch340Device *g_dev = NULL;
 static char g_file_path[256];
 
+// ============================================================
 Result gcode_init(void) {
     mutexInit(&g_status_mutex);
     memset(&g_status, 0, sizeof(g_status));
@@ -21,11 +22,15 @@ Result gcode_init(void) {
     return 0;
 }
 
+// ============================================================
+// 等待打印机返回 "ok"（正确处理 Marlin "ok T:" 温度+确认响应）
+// ============================================================
 static Result wait_ok(Ch340Device *dev, u64 timeout_ms) {
     char buf[128];
     size_t received;
-    u64 start = armGetSystemTick();
-    while (armGetSystemTick() - start < timeout_ms) {
+    u64 deadline = armGetSystemTick() + armNsToTicks(timeout_ms * 1000000ULL);
+
+    while (armGetSystemTick() < deadline) {
         Result rc = ch340_recv(dev, buf, sizeof(buf) - 1, 100, &received);
         if (R_FAILED(rc)) {
             if (rc == MAKERESULT(0xEA01, 0)) continue;
@@ -33,25 +38,30 @@ static Result wait_ok(Ch340Device *dev, u64 timeout_ms) {
         }
         if (received > 0) {
             buf[received] = '\0';
-            if (buf[0] == 'o' && buf[1] == 'k' &&
-                (buf[2] == '\0' || buf[2] == '\n' || buf[2] == '\r' || buf[2] == ' '))
-                return 0;
-            if (strncmp(buf, "ok T:", 5) == 0 || strncmp(buf, "T:", 2) == 0) {
+            // 先解析温度——"ok T:..." 中 T: 必须在 ok 检查之前处理
+            char *tpos = strstr(buf, "T:");
+            if (tpos) {
                 float na = 0, nt = 0, ba = 0, bt = 0;
-                sscanf(buf, "%*s T:%f /%f B:%f /%f", &na, &nt, &ba, &bt);
+                sscanf(tpos, "T:%f /%f B:%f /%f", &na, &nt, &ba, &bt);
                 mutexLock(&g_status_mutex);
                 g_status.temp.nozzle_actual = na;
                 g_status.temp.nozzle_target = nt;
                 g_status.temp.bed_actual = ba;
                 g_status.temp.bed_target = bt;
                 mutexUnlock(&g_status_mutex);
-                if (strstr(buf, "ok") != NULL) return 0;
             }
+            // 检查 "ok"（可以是 "ok"、"ok\n"、"ok "、"ok T:..."）
+            if (buf[0] == 'o' && buf[1] == 'k' &&
+                (buf[2] == '\0' || buf[2] == '\n' || buf[2] == '\r' || buf[2] == ' '))
+                return 0;
         }
     }
     return MAKERESULT(Module_Libnx, 5);
 }
 
+// ============================================================
+// 打印线程主函数
+// ============================================================
 static void print_thread_func(void *arg) {
     FILE *fp = fopen(g_file_path, "r");
     if (!fp) {
@@ -60,43 +70,55 @@ static void print_thread_func(void *arg) {
         mutexUnlock(&g_status_mutex);
         return;
     }
+
     int total_lines = 0;
     char line_buf[GCODE_LINE_MAX];
     while (fgets(line_buf, sizeof(line_buf), fp)) total_lines++;
     rewind(fp);
+
     mutexLock(&g_status_mutex);
     g_status.state = PRINTER_PRINTING;
     g_status.lines_total = total_lines;
     g_status.lines_sent = 0;
     g_status.progress_percent = 0;
     mutexUnlock(&g_status_mutex);
+
     int line_num = 0;
     bool error = false;
+
     while (fgets(line_buf, sizeof(line_buf), fp) &&
            !atomic_load(&g_cancel)) {
         while (atomic_load(&g_paused) && !atomic_load(&g_cancel))
             svcSleepThread(100000000ULL);
         if (atomic_load(&g_cancel)) break;
+
         size_t len = strlen(line_buf);
         while (len > 0 && (line_buf[len-1] == '\n' || line_buf[len-1] == '\r'))
             line_buf[--len] = '\0';
+
         if (len == 0 || line_buf[0] == ';') continue;
+
         if (len >= GCODE_LINE_MAX - 2) len = GCODE_LINE_MAX - 3;
         line_buf[len] = '\n'; line_buf[len+1] = '\0';
+
         Result rc = ch340_send(g_dev, line_buf, len + 1);
         if (R_FAILED(rc)) { error = true; break; }
+
         rc = wait_ok(g_dev, GCODE_OK_TIMEOUT);
         if (R_FAILED(rc)) { error = true; break; }
+
         line_num++;
         mutexLock(&g_status_mutex);
         g_status.lines_sent = line_num;
         if (total_lines > 0)
             g_status.progress_percent = (line_num * 100) / total_lines;
         mutexUnlock(&g_status_mutex);
+
         svcSleepThread(1000000ULL);
     }
+
     fclose(fp);
-    atomic_store(&g_thread_running, false);
+
     mutexLock(&g_status_mutex);
     if (atomic_load(&g_cancel)) {
         g_status.state = PRINTER_IDLE;
@@ -112,8 +134,10 @@ static void print_thread_func(void *arg) {
         g_status.lines_sent = total_lines;
     }
     mutexUnlock(&g_status_mutex);
+    atomic_store(&g_thread_running, false);
 }
 
+// ============================================================
 Result gcode_start_print(Ch340Device *dev, const char *file_path) {
     if (!dev->connected) return MAKERESULT(Module_Libnx, 1);
     mutexLock(&g_status_mutex);
@@ -126,6 +150,7 @@ Result gcode_start_print(Ch340Device *dev, const char *file_path) {
     g_status.state = PRINTER_PRINTING;
     strncpy(g_status.current_file, file_path, sizeof(g_status.current_file) - 1);
     mutexUnlock(&g_status_mutex);
+
     Result rc = threadCreate(&g_print_thread, print_thread_func, NULL, NULL, 0x10000, 0x30, -1);
     if (R_FAILED(rc)) {
         mutexLock(&g_status_mutex);
@@ -176,14 +201,17 @@ Result gcode_query_temp(Ch340Device *dev, PrinterTemp *temp) {
     if (!dev->connected) return MAKERESULT(Module_Libnx, 1);
     Result rc = ch340_send(dev, "M105\n", 5);
     if (R_FAILED(rc)) return rc;
+
     char buf[128];
     size_t received;
     rc = ch340_recv(dev, buf, sizeof(buf) - 1, 2000, &received);
     if (R_FAILED(rc)) return rc;
+
     buf[received] = '\0';
     float na = 0, nt = 0, ba = 0, bt = 0;
     char *tpos = strstr(buf, "T:");
     if (tpos) sscanf(tpos, "T:%f /%f B:%f /%f", &na, &nt, &ba, &bt);
+
     mutexLock(&g_status_mutex);
     g_status.temp.nozzle_actual = na;
     g_status.temp.nozzle_target = nt;
@@ -194,7 +222,9 @@ Result gcode_query_temp(Ch340Device *dev, PrinterTemp *temp) {
     return 0;
 }
 
-Result gcode_home(Ch340Device *dev) { return gcode_send_raw(dev, "G28"); }
+Result gcode_home(Ch340Device *dev) {
+    return gcode_send_raw(dev, "G28");
+}
 
 Result gcode_move(Ch340Device *dev, float x, float y, float z, float feedrate) {
     char buf[128];

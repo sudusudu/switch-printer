@@ -85,12 +85,12 @@ Result ch340_connect(Ch340Device *dev) {
 
     struct usb_endpoint_descriptor *out_desc = NULL;
     struct usb_endpoint_descriptor *in_desc  = NULL;
-    for (s32 i = 0; i < limit; i++) {
+    for (s32 idx = 0; idx < limit; idx++) {
         for (int j = 0; j < 15; j++) {
-            if (interfaces[i].inf.output_endpoint_descs[j].bEndpointAddress != 0 && !out_desc)
-                out_desc = &interfaces[i].inf.output_endpoint_descs[j];
-            if (interfaces[i].inf.input_endpoint_descs[j].bEndpointAddress != 0 && !in_desc)
-                in_desc = &interfaces[i].inf.input_endpoint_descs[j];
+            if (interfaces[idx].inf.output_endpoint_descs[j].bEndpointAddress != 0 && !out_desc)
+                out_desc = &interfaces[idx].inf.output_endpoint_descs[j];
+            if (interfaces[idx].inf.input_endpoint_descs[j].bEndpointAddress != 0 && !in_desc)
+                in_desc = &interfaces[idx].inf.input_endpoint_descs[j];
         }
         if (out_desc && in_desc) break;
     }
@@ -133,18 +133,22 @@ fail:
 }
 
 void ch340_disconnect(Ch340Device *dev) {
-    if (!dev->connected) return;
+    mutexLock(&dev->mutex);
+    if (!dev->connected) { mutexUnlock(&dev->mutex); return; }
     dev->connected = false;
     usbHsEpClose(&dev->ep_in);
     usbHsEpClose(&dev->ep_out);
     usbHsIfClose(&dev->if_session);
+    mutexUnlock(&dev->mutex);
 }
 
 Result ch340_send(Ch340Device *dev, const void *data, size_t len) {
     if (!dev->connected) return MAKERESULT(Module_Libnx, 1);
     if (len > 0x1000) len = 0x1000;
+
     mutexLock(&dev->mutex);
     memcpy(dev->tx_buf, data, len);
+
     u32 transferred = 0;
     Result rc = usbHsEpPostBuffer(&dev->ep_out, dev->tx_buf, len, &transferred);
     mutexUnlock(&dev->mutex);
@@ -156,9 +160,11 @@ Result ch340_recv(Ch340Device *dev, void *buf, size_t max_len,
     if (!dev->connected) return MAKERESULT(Module_Libnx, 1);
     if (max_len > 0x1000) max_len = 0x1000;
     *received = 0;
+
     mutexLock(&dev->mutex);
     u32 transferred = 0;
     Result rc = usbHsEpPostBuffer(&dev->ep_in, dev->rx_buf, max_len, &transferred);
+
     if (R_SUCCEEDED(rc) && transferred > 0 && transferred <= max_len) {
         memcpy(buf, dev->rx_buf, transferred);
         *received = transferred;
