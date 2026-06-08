@@ -4,9 +4,9 @@ TARGET    := switch_printer
 BUILD     := build
 SRCDIR    := source
 
-CC := aarch64-none-elf-gcc
+override CC := aarch64-none-elf-gcc
 
-ARCH := -march=armv8-a -mtune=cortex-a57 -mtp=soft -fPIE
+ARCH := -march=armv8-a -mtune=cortex-a57 -fPIE
 
 CFLAGS  := -g -Wall -O2 $(ARCH) -I$(SRCDIR) -D__SWITCH__
 LDFLAGS := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH)

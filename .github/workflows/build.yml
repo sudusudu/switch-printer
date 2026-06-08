@@ -15,28 +15,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Test Toolchain
+      - name: Build NRO
         run: |
           export DEVKITPRO=/opt/devkitpro
           export PATH="$DEVKITPRO/devkitA64/bin:$DEVKITPRO/tools/bin:$PATH"
-          echo "=== Tools ==="
-          aarch64-none-elf-gcc --version 2>&1 | head -1 || echo "GCC FAILED"
-          nacptool 2>&1 | head -3 || echo "NACP expected help msg, this is OK"
-          elf2nro 2>&1 | head -3 || echo "ELF2NRO expected help msg, this is OK"
-          echo "=== libnx ==="
-          ls /opt/devkitpro/libnx/include/switch.h 2>&1 || echo "No switch.h"
-          echo "=== Test Compile ==="
-          echo "int main(){return 0;}" > /tmp/test.c
-          aarch64-none-elf-gcc -c /tmp/test.c -o /tmp/test.o 2>&1 && echo "COMPILE OK" || echo "COMPILE FAIL"
-
-      - name: Full Build
-        run: |
-          export DEVKITPRO=/opt/devkitpro
-          export PATH="$DEVKITPRO/devkitA64/bin:$DEVKITPRO/tools/bin:$PATH"
-          make clean 2>/dev/null || true
-          make 2>&1 || echo "MAKE_EXIT=FAILED"
-          echo "=== Files ==="
-          find build/ -type f 2>/dev/null || echo "No build dir"
+          make 2>&1
+          ls -la build/
 
       - uses: actions/upload-artifact@v4
         if: success()
