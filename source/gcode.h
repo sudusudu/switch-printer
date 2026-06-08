@@ -36,4 +36,5 @@ Result gcode_query_temp(Ch340Device *dev, PrinterTemp *temp);
 Result gcode_home(Ch340Device *dev);
 Result gcode_move(Ch340Device *dev, float x, float y, float z, float feedrate);
 PrinterStatus *gcode_get_status(void);
+void gcode_get_status_safe(PrinterStatus *out);
 void gcode_update(Ch340Device *dev);

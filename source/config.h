@@ -1,8 +1,9 @@
 #pragma once
 
 // --- WiFi ---
-#define WIFI_SSID      "WIFI"
-#define WIFI_PASS      "88881111"
+// 必填：改成你的 WiFi 名和密码
+#define WIFI_SSID      "YOUR_SSID"
+#define WIFI_PASS      "YOUR_PASS"
 
 // --- HTTP Server ---
 #define HTTP_PORT      8080
