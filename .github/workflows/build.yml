@@ -15,23 +15,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup and Build
+      - name: Build
         run: |
           export DEVKITPRO=/opt/devkitpro
           export PATH="$DEVKITPRO/devkitA64/bin:$DEVKITPRO/tools/bin:$PATH"
+          set -e
 
-          echo "=== Tool Check ==="
-          which aarch64-none-elf-gcc
-          aarch64-none-elf-gcc --version | head -1
-          which nacptool
-          which elf2nro
           echo "DEVKITPRO=$DEVKITPRO"
-          ls $DEVKITPRO/libnx/
+          echo "CC=$(which aarch64-none-elf-gcc 2>/dev/null || echo NOT_FOUND)"
+          echo "nacptool=$(which nacptool 2>/dev/null || echo NOT_FOUND)"
+          echo "elf2nro=$(which elf2nro 2>/dev/null || echo NOT_FOUND)"
+          ls /opt/devkitpro/libnx/ 2>/dev/null | head -15
 
-          echo "=== Building ==="
-          make -j$(nproc) V=1 2>&1
+          make -j2 2>&1
 
-          echo "=== Result ==="
+          echo "---BUILD OUTPUT---"
           ls -la build/
 
       - uses: actions/upload-artifact@v4
