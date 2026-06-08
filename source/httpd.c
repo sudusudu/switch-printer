@@ -36,9 +36,11 @@ static void send_response(int client, int code, const char *ctype, const char *b
     char hdr[512];
     int len = (int)strlen(body);
     int n = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\n"
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %d\r\n"
         "Connection: close\r\n\r\n",
-        code, code==200?"OK":"Error", ctype, len);
+        code, code == 200 ? "OK" : "Error", ctype, len);
     send(client, hdr, n, 0);
     send(client, body, len, 0);
 }
@@ -58,18 +60,17 @@ static void parse_path(const char *req, char *path, size_t max) {
 static char api_buf[1024];
 
 static void handle_api(int client, Ch340Device *dev, const char *path) {
-    PrinterStatus st_safe;
-    gcode_get_status_safe(&st_safe);
-    PrinterStatus *st = &st_safe;
+    PrinterStatus st;
+    gcode_get_status_safe(&st);
     const char *resp = api_buf;
-
     if (strcmp(path, "/api/status") == 0) {
         const char *state_names[] = {"offline","idle","printing","paused","error"};
-        const char *sn = (st->state < 5) ? state_names[st->state] : "unknown";
+        const char *sn = (st.state < 5) ? state_names[st.state] : "unknown";
         snprintf(api_buf, sizeof(api_buf), JSON_STATUS,
-            sn, st->temp.nozzle_actual, st->temp.nozzle_target,
-            st->temp.bed_actual, st->temp.bed_target,
-            st->progress_percent, st->lines_sent, st->lines_total, st->current_file);
+            sn, st.temp.nozzle_actual, st.temp.nozzle_target,
+            st.temp.bed_actual, st.temp.bed_target,
+            st.progress_percent, st.lines_sent, st.lines_total,
+            st.current_file);
     }
     else if (strcmp(path, "/api/home") == 0) {
         gcode_home(dev);
@@ -123,7 +124,6 @@ static void handle_upload(int client, const char *req_body, int body_len) {
             filename[flen] = '\0';
         }
     }
-    // 路径穿越防护
     for (char *p = filename; *p; p++)
         if (*p == '/' || *p == '\\' || *p == ':') *p = '_';
     char *dot;
@@ -133,10 +133,10 @@ static void handle_upload(int client, const char *req_body, int body_len) {
     while (*safe == '.') safe++;
     if (safe != filename) memmove(filename, safe, strlen(safe) + 1);
     if (filename[0] == '\0') strcpy(filename, "upload.gcode");
-
     const char *data_start = NULL;
     for (int i = 0; i < body_len - 3; i++) {
-        if (req_body[i]=='\r' && req_body[i+1]=='\n' && req_body[i+2]=='\r' && req_body[i+3]=='\n') {
+        if (req_body[i]=='\r' && req_body[i+1]=='\n' &&
+            req_body[i+2]=='\r' && req_body[i+3]=='\n') {
             data_start = req_body + i + 4;
             break;
         }
@@ -182,23 +182,21 @@ static void server_thread_func(void *arg) {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(HTTP_PORT);
-    if (bind(g_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(g_sock); g_sock=-1; return; }
-    if (listen(g_sock, 5) < 0) { close(g_sock); g_sock=-1; return; }
+    if (bind(g_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(g_sock); return; }
+    if (listen(g_sock, 5) < 0) { close(g_sock); return; }
     struct timeval tv; tv.tv_sec=1; tv.tv_usec=0;
     setsockopt(g_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    char req_buf[16384];
-
+    char req_buf[HTTP_REQ_BUF_SIZE];
     while (g_running) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client = accept(g_sock, (struct sockaddr*)&client_addr, &client_len);
+        struct sockaddr_in ca;
+        socklen_t cl = sizeof(ca);
+        int client = accept(g_sock, (struct sockaddr*)&ca, &cl);
         if (client < 0) { if (!g_running) break; continue; }
         int recvd = recv(client, req_buf, sizeof(req_buf)-1, 0);
         if (recvd <= 0) { close(client); continue; }
         req_buf[recvd] = '\0';
         char path[256];
         parse_path(req_buf, path, sizeof(path));
-
         if (strcmp(path, "/")==0 || strncmp(path, "/index",6)==0) {
             send_response(client, 200, "text/html;charset=utf-8", WEB_INDEX_HTML);
         }
@@ -206,16 +204,18 @@ static void server_thread_func(void *arg) {
             handle_api(client, g_printer, path);
         }
         else if (strcmp(path, "/upload")==0) {
-            const char *cl = strstr(req_buf, "Content-Length:");
+            const char *cl_hdr = strstr(req_buf, "Content-Length:");
             const char *hd_end = strstr(req_buf, "\r\n\r\n");
             int body_len = 0;
-            if (cl) body_len = atoi(cl + 15);
+            if (cl_hdr) body_len = atoi(cl_hdr + 15);
             if (hd_end && body_len > 0) {
                 int hdr_len = (int)(hd_end - req_buf) + 4;
                 int body_got = recvd - hdr_len;
                 int remain = body_len - body_got;
-                if (remain > 0 && remain < (int)(sizeof(req_buf) - recvd))
-                    recv(client, req_buf + recvd, remain, 0);
+                if (remain > 0 && remain < (int)(sizeof(req_buf) - recvd)) {
+                    int more = recv(client, req_buf + recvd, remain, 0);
+                    if (more > 0) recvd += more;
+                }
             }
             handle_upload(client, req_buf, recvd);
         }
@@ -226,7 +226,6 @@ static void server_thread_func(void *arg) {
         close(client);
     }
     close(g_sock);
-    g_sock = -1;
 }
 
 Result httpd_init(void) { return 0; }
@@ -234,7 +233,7 @@ Result httpd_init(void) { return 0; }
 Result httpd_start(Ch340Device *printer_dev) {
     g_printer = printer_dev;
     g_running = true;
-    Result rc = threadCreate(&g_server_thread, server_thread_func, NULL, NULL, 0x10000, 0x2C, -1);
+    Result rc = threadCreate(&g_server_thread, server_thread_func, NULL, NULL, 0x10000, 0x2B, -1);
     if (R_FAILED(rc)) { g_running = false; return rc; }
     threadStart(&g_server_thread);
     return 0;
