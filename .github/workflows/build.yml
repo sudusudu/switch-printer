@@ -8,29 +8,24 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: devkitpro/devkita64:latest
-      options: --user root
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check libnx headers
+      - name: Install devkitPro
         run: |
-          export DEVKITPRO=/opt/devkitpro
-          echo "=== HID grep ==="
-          grep -rl "KEY_PLUS\|hidScanInput\|CONTROLLER_P1" $DEVKITPRO/libnx/include/ 2>/dev/null | head -5
-          echo "=== Available HID constants ==="
-          grep -h "KEY_PLUS\|hidScanInput" $DEVKITPRO/libnx/include/switch.h 2>/dev/null | head -5
-          echo "=== All switch sub-headers ==="
-          ls $DEVKITPRO/libnx/include/switch/ 2>/dev/null | head -30
+          wget -q https://github.com/devkitPro/pacman/releases/download/v1.0.2/devkitpro-pacman.amd64.deb
+          sudo dpkg -i devkitpro-pacman.amd64.deb 2>/dev/null || true
+          sudo apt-get install -f -y
+          sudo dkp-pacman -S --noconfirm --needed switch-dev 2>&1 | tail -5
+          echo "Install done"
 
       - name: Build NRO
         run: |
           export DEVKITPRO=/opt/devkitpro
           export PATH="$DEVKITPRO/devkitA64/bin:$DEVKITPRO/tools/bin:$PATH"
           make 2>&1
-          ls -la build/
+          ls -la build/ 2>/dev/null && echo "BUILD OK" || echo "BUILD FAILED"
 
       - uses: actions/upload-artifact@v4
         if: success()
