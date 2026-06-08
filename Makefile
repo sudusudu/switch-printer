@@ -8,8 +8,8 @@ override CC := aarch64-none-elf-gcc
 
 ARCH := -march=armv8-a -mtune=cortex-a57 -fPIE
 
-CFLAGS  := -g -Wall -O2 $(ARCH) -I$(SRCDIR) -D__SWITCH__
-LDFLAGS := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH)
+CFLAGS  := -g -Wall -O2 $(ARCH) -I$(SRCDIR) -I$(DEVKITPRO)/libnx/include -D__SWITCH__
+LDFLAGS := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -L$(DEVKITPRO)/libnx/lib -L$(DEVKITPRO)/portlibs/lib
 LIBS    := -lnx -lm
 
 SRCS := $(wildcard $(SRCDIR)/*.c)
