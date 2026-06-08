@@ -1,0 +1,28 @@
+name: Build Switch Printer NRO
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:latest
+      options: --user root
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build NRO
+        run: |
+          make -j$(nproc)
+
+      - name: Upload NRO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: switch-printer-nro
+          path: |
+            build/switch_printer.nro
+            build/switch_printer.elf
