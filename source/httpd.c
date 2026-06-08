@@ -6,6 +6,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static Ch340Device *g_printer = NULL;
@@ -14,32 +17,44 @@ static Thread g_server_thread;
 static char g_ip_str[32] = "0.0.0.0";
 static int g_sock = -1;
 
+// ============================================================
+// 获取 Switch 本机 IP
+// ============================================================
 static void update_ip(void) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return;
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, "wlan0", sizeof(ifr.ifr_name)-1);
+    strncpy(ifr.ifr_name, "wlan0", sizeof(ifr.ifr_name) - 1);
     if (ioctl(fd, SIOCGIFADDR, &ifr) == 0) {
         struct sockaddr_in *sa = (struct sockaddr_in *)&ifr.ifr_addr;
-        strncpy(g_ip_str, inet_ntoa(sa->sin_addr), sizeof(g_ip_str)-1);
+        strncpy(g_ip_str, inet_ntoa(sa->sin_addr), sizeof(g_ip_str) - 1);
     }
     close(fd);
 }
 
 const char *httpd_get_ip(void) { return g_ip_str; }
 
+// ============================================================
+// 发送 HTTP 响应
+// ============================================================
 static void send_response(int client, int code, const char *ctype, const char *body) {
     char hdr[512];
     int len = (int)strlen(body);
     int n = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\n"
-        "Connection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
-        code, code==200?"OK":"Error", ctype, len);
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "Access-Control-Allow-Origin: *\r\n\r\n",
+        code, code == 200 ? "OK" : "Error", ctype, len);
     send(client, hdr, n, 0);
     send(client, body, len, 0);
 }
 
+// ============================================================
+// 解析 URL 路径
+// ============================================================
 static void parse_path(const char *req, char *path, size_t max) {
     const char *start = strchr(req, ' ');
     if (!start) { strncpy(path, "/", max); return; }
@@ -52,59 +67,70 @@ static void parse_path(const char *req, char *path, size_t max) {
     path[len] = '\0';
 }
 
+// ============================================================
+// 处理 API 请求
+// ============================================================
 static char api_buf[1024];
 
 static void handle_api(int client, Ch340Device *dev, const char *path) {
     PrinterStatus *st = gcode_get_status();
     const char *resp = api_buf;
+
     if (strcmp(path, "/api/status") == 0) {
         const char *state_names[] = {"offline","idle","printing","paused","error"};
         const char *sn = (st->state < 5) ? state_names[st->state] : "unknown";
         snprintf(api_buf, sizeof(api_buf), JSON_STATUS,
             sn, st->temp.nozzle_actual, st->temp.nozzle_target,
             st->temp.bed_actual, st->temp.bed_target,
-            st->progress_percent, st->lines_sent, st->lines_total, st->current_file);
+            st->progress_percent, st->lines_sent, st->lines_total,
+            st->current_file);
     }
     else if (strcmp(path, "/api/home") == 0) {
         gcode_home(dev);
-        snprintf(api_buf, sizeof(api_buf), JSON_OK, "Home done");
+        snprintf(api_buf, sizeof(api_buf), JSON_OK, "归零完成");
     }
     else if (strcmp(path, "/api/pause") == 0) {
         gcode_pause();
-        snprintf(api_buf, sizeof(api_buf), JSON_OK, "Paused");
+        snprintf(api_buf, sizeof(api_buf), JSON_OK, "已暂停");
     }
     else if (strcmp(path, "/api/resume") == 0) {
         gcode_resume();
-        snprintf(api_buf, sizeof(api_buf), JSON_OK, "Resumed");
+        snprintf(api_buf, sizeof(api_buf), JSON_OK, "已恢复");
     }
     else if (strcmp(path, "/api/cancel") == 0) {
         gcode_cancel(dev);
-        snprintf(api_buf, sizeof(api_buf), JSON_OK, "Cancelled");
+        snprintf(api_buf, sizeof(api_buf), JSON_OK, "已取消");
     }
     else if (strncmp(path, "/api/move", 9) == 0) {
-        float dx=0,dy=0,dz=0;
+        // 解析 /api/move?axis=x&dist=10
+        float dx = 0, dy = 0, dz = 0;
         char *qs = strchr((char*)path, '?');
         if (qs) {
             char *ax = strstr(qs, "axis=");
             char *di = strstr(qs, "dist=");
             if (ax && di) {
                 char axis = ax[5];
-                float dist = (float)atof(di+5);
-                if (axis=='x') dx=dist;
-                if (axis=='y') dy=dist;
-                if (axis=='z') dz=dist;
+                float dist = (float)atof(di + 5);
+                if (axis == 'x') dx = dist;
+                if (axis == 'y') dy = dist;
+                if (axis == 'z') dz = dist;
             }
         }
         gcode_move(dev, dx, dy, dz, 1000);
-        snprintf(api_buf, sizeof(api_buf), JSON_OK, "Moved");
+        snprintf(api_buf, sizeof(api_buf), JSON_OK, "已移动");
     }
     else {
-        snprintf(api_buf, sizeof(api_buf), JSON_ERR, "Unknown API");
+        snprintf(api_buf, sizeof(api_buf), JSON_ERR, "未知API");
     }
     send_response(client, 200, "application/json", resp);
 }
 
+// ============================================================
+// 处理文件上传
+// ============================================================
 static void handle_upload(int client, const char *req_body, int body_len) {
+    // 查找 gcode 文件内容：\r\n\r\n 之后
+    // 简化实现：找 filename= 来确定文件名
     const char *fn = strstr(req_body, "filename=\"");
     char filename[256] = "upload.gcode";
     if (fn) {
@@ -117,95 +143,186 @@ static void handle_upload(int client, const char *req_body, int body_len) {
             filename[flen] = '\0';
         }
     }
+
+    // 找文件内容：\r\n\r\n 标记
     const char *data_start = NULL;
     for (int i = 0; i < body_len - 3; i++) {
-        if (req_body[i]=='\r' && req_body[i+1]=='\n' && req_body[i+2]=='\r' && req_body[i+3]=='\n') {
+        if (req_body[i] == '\r' && req_body[i+1] == '\n' &&
+            req_body[i+2] == '\r' && req_body[i+3] == '\n') {
             data_start = req_body + i + 4;
             break;
         }
     }
+
     if (!data_start) {
-        snprintf(api_buf, sizeof(api_buf), JSON_ERR, "Bad upload");
+        snprintf(api_buf, sizeof(api_buf), JSON_ERR, "无法解析上传文件");
         send_response(client, 400, "application/json", api_buf);
         return;
     }
+
     int data_len = body_len - (int)(data_start - req_body);
-    for (int i = data_len - 2; i >= 0; i--) {
-        if (data_start[i]=='-' && i>0 && data_start[i-1]=='-') {
-            data_len = i - 1;
-            break;
+    // 去掉末尾的 boundary 标记
+    const char *boundary = strstr(req_body, "boundary=");
+    if (boundary) {
+        char bd[128];
+        strncpy(bd, boundary + 9, sizeof(bd) - 1);
+        bd[sizeof(bd)-1] = '\0';
+        char *end = strchr(bd, '\r');
+        if (end) *end = '\0';
+
+        // 找末尾 boundary
+        char *last = (char*)data_start + data_len - 2;
+        for (int i = data_len - 2; i >= 0; i--) {
+            if (data_start[i] == '-' && i > 0 && data_start[i-1] == '-') {
+                data_len = i - 1;
+                break;
+            }
         }
     }
+
+    // 保存到 SD 卡
     char filepath[320];
     snprintf(filepath, sizeof(filepath), "sdmc:/switch/gcode/%s", filename);
+
+    // 确保目录存在
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/gcode", 0777);
+
     FILE *fp = fopen(filepath, "wb");
     if (!fp) {
-        snprintf(api_buf, sizeof(api_buf), JSON_ERR, "Cannot create file");
+        snprintf(api_buf, sizeof(api_buf), JSON_ERR, "无法创建文件");
         send_response(client, 500, "application/json", api_buf);
         return;
     }
     fwrite(data_start, 1, data_len, fp);
     fclose(fp);
+
+    // 开始打印！
     gcode_start_print(g_printer, filepath);
-    snprintf(api_buf, sizeof(api_buf), "{\"ok\":true,\"msg\":\"Printing: %s\"}", filename);
+
+    snprintf(api_buf, sizeof(api_buf), "{\"ok\":true,\"msg\":\"已上传并开始打印: %s\",\"lines\":%d}",
+             filename, data_len / 50); // 估算行数
     send_response(client, 200, "application/json", api_buf);
 }
 
+// ============================================================
+// 解析 multipart boundary
+// ============================================================
+static const char *find_boundary(const char *req) {
+    const char *b = strstr(req, "boundary=");
+    if (!b) return NULL;
+    return b + 9; // 跳过 "boundary="
+}
+
+// ============================================================
+// 服务器主循环
+// ============================================================
 static void server_thread_func(void *arg) {
     (void)arg;
     update_ip();
+
     g_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (g_sock < 0) return;
+
     int opt = 1;
     setsockopt(g_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(HTTP_PORT);
-    if (bind(g_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(g_sock); g_sock=-1; return; }
-    if (listen(g_sock, 5) < 0) { close(g_sock); g_sock=-1; return; }
-    struct timeval tv; tv.tv_sec=1; tv.tv_usec=0;
+
+    if (bind(g_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(g_sock);
+        g_sock = -1;
+        return;
+    }
+
+    if (listen(g_sock, 5) < 0) {
+        close(g_sock);
+        g_sock = -1;
+        return;
+    }
+
+    // 设置 accept 超时
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
     setsockopt(g_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     char req_buf[16384];
+
     while (g_running) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int client = accept(g_sock, (struct sockaddr*)&client_addr, &client_len);
-        if (client < 0) { if (!g_running) break; continue; }
-        int recvd = recv(client, req_buf, sizeof(req_buf)-1, 0);
-        if (recvd <= 0) { close(client); continue; }
+
+        if (client < 0) {
+            if (!g_running) break;
+            continue;
+        }
+
+        // 接收请求
+        int recvd = recv(client, req_buf, sizeof(req_buf) - 1, 0);
+        if (recvd <= 0) {
+            close(client);
+            continue;
+        }
         req_buf[recvd] = '\0';
+
+        // 解析路径
         char path[256];
         parse_path(req_buf, path, sizeof(path));
-        if (strcmp(path, "/")==0 || strncmp(path, "/index",6)==0) {
+
+        // 路由
+        if (strcmp(path, "/") == 0 || strncmp(path, "/index", 6) == 0) {
             send_response(client, 200, "text/html;charset=utf-8", WEB_INDEX_HTML);
         }
-        else if (strncmp(path, "/api/",5)==0) {
+        else if (strncmp(path, "/api/", 5) == 0) {
             handle_api(client, g_printer, path);
         }
-        else if (strcmp(path, "/upload")==0) {
+        else if (strcmp(path, "/upload") == 0 || strncmp(path, "/upload", 7) == 0) {
+            // 找 Content-Length
+            const char *cl = strstr(req_buf, "Content-Length:");
+            int body_len = 0;
+            if (cl) body_len = atoi(cl + 15);
+            if (body_len > 0 && body_len < (int)(sizeof(req_buf) - recvd)) {
+                // 可能需要再接收剩余 body
+                int remain = body_len - (recvd - (int)(strstr(req_buf, "\r\n\r\n") - req_buf + 4));
+                if (remain > 0) {
+                    recv(client, req_buf + recvd, remain, 0);
+                }
+            }
             handle_upload(client, req_buf, recvd);
         }
         else {
-            snprintf(api_buf, sizeof(api_buf), JSON_ERR, "404");
+            snprintf(api_buf, sizeof(api_buf), JSON_ERR, "404 未找到");
             send_response(client, 404, "application/json", api_buf);
         }
+
         close(client);
     }
+
     close(g_sock);
     g_sock = -1;
 }
 
-Result httpd_init(void) { return 0; }
+// ============================================================
+Result httpd_init(void) {
+    return 0;
+}
 
 Result httpd_start(Ch340Device *printer_dev) {
     g_printer = printer_dev;
     g_running = true;
-    Result rc = threadCreate(&g_server_thread, server_thread_func, NULL, NULL, 0x10000, 0x2C, -1);
-    if (R_FAILED(rc)) { g_running = false; return rc; }
+
+    Result rc = threadCreate(&g_server_thread, server_thread_func, NULL, NULL,
+                              0x10000, 0x2C, -1);
+    if (R_FAILED(rc)) {
+        g_running = false;
+        return rc;
+    }
     threadStart(&g_server_thread);
     return 0;
 }
