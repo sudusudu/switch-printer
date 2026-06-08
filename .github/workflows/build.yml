@@ -18,14 +18,13 @@ jobs:
           sudo dpkg -i devkitpro-pacman.amd64.deb 2>/dev/null || true
           sudo apt-get install -f -y
           sudo dkp-pacman -S --noconfirm --needed switch-dev 2>&1 | tail -5
-          echo "Install done"
 
       - name: Build NRO
         run: |
           export DEVKITPRO=/opt/devkitpro
           export PATH="$DEVKITPRO/devkitA64/bin:$DEVKITPRO/tools/bin:$PATH"
           make 2>&1
-          ls -la build/ 2>/dev/null && echo "BUILD OK" || echo "BUILD FAILED"
+          ls -la build/
 
       - uses: actions/upload-artifact@v4
         if: success()
