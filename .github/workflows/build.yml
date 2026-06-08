@@ -15,6 +15,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check libnx headers
+        run: |
+          export DEVKITPRO=/opt/devkitpro
+          echo "=== HID grep ==="
+          grep -rl "KEY_PLUS\|hidScanInput\|CONTROLLER_P1" $DEVKITPRO/libnx/include/ 2>/dev/null | head -5
+          echo "=== Available HID constants ==="
+          grep -h "KEY_PLUS\|hidScanInput" $DEVKITPRO/libnx/include/switch.h 2>/dev/null | head -5
+          echo "=== All switch sub-headers ==="
+          ls $DEVKITPRO/libnx/include/switch/ 2>/dev/null | head -30
+
       - name: Build NRO
         run: |
           export DEVKITPRO=/opt/devkitpro
