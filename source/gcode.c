@@ -6,6 +6,7 @@
 static PrinterStatus g_status;
 static volatile bool g_paused = false;
 static volatile bool g_cancel = false;
+static bool g_thread_running = false;
 static Mutex g_status_mutex;
 
 // 打印线程
@@ -32,17 +33,13 @@ static Result wait_ok(Ch340Device *dev, u64 timeout_ms) {
     while (armGetSystemTick() - start < timeout_ms) {
         Result rc = ch340_recv(dev, buf, sizeof(buf) - 1, 100, &received);
         if (R_FAILED(rc)) {
-            // 超时继续等待
             if (rc == MAKERESULT(0xEA01, 0)) continue;
             return rc;
         }
         if (received > 0) {
             buf[received] = '\0';
-            // 检查是否为 "ok"
             if (strncmp(buf, "ok", 2) == 0) return 0;
-            // 检查温度报告
             if (strncmp(buf, "T:", 2) == 0 || strncmp(buf, "ok T:", 5) == 0) {
-                // 解析温度
                 float nozzle_actual = 0, nozzle_target = 0;
                 float bed_actual = 0, bed_target = 0;
                 sscanf(buf, "%*s T:%f /%f B:%f /%f",
@@ -53,7 +50,6 @@ static Result wait_ok(Ch340Device *dev, u64 timeout_ms) {
                 g_status.temp.bed_actual = bed_actual;
                 g_status.temp.bed_target = bed_target;
                 mutexUnlock(&g_status_mutex);
-                // 这也算是 ok 回应
                 if (strstr(buf, "ok") != NULL) return 0;
             }
         }
@@ -73,7 +69,6 @@ static void print_thread_func(void *arg) {
         return;
     }
 
-    // 统计总行数
     int total_lines = 0;
     char line_buf[GCODE_LINE_MAX];
     while (fgets(line_buf, sizeof(line_buf), fp)) total_lines++;
@@ -90,47 +85,37 @@ static void print_thread_func(void *arg) {
     bool error = false;
 
     while (fgets(line_buf, sizeof(line_buf), fp) && !g_cancel) {
-        // 暂停等待
         while (g_paused && !g_cancel) {
-            svcSleepThread(100000000ULL); // 100ms
+            svcSleepThread(100000000ULL);
         }
         if (g_cancel) break;
 
-        // 去掉末尾换行
         size_t len = strlen(line_buf);
         while (len > 0 && (line_buf[len-1] == '\n' || line_buf[len-1] == '\r')) {
             line_buf[--len] = '\0';
         }
 
-        if (len == 0) continue; // 空行跳过
-        if (line_buf[0] == ';') continue; // 注释跳过
+        if (len == 0) continue;
+        if (line_buf[0] == ';') continue;
 
-        // 发送此行
-        // 追加换行
+        if (len >= GCODE_LINE_MAX - 2) len = GCODE_LINE_MAX - 3;
         line_buf[len] = '\n';
         line_buf[len+1] = '\0';
 
         Result rc = ch340_send(g_dev, line_buf, len + 1);
-        if (R_FAILED(rc)) {
-            error = true;
-            break;
-        }
+        if (R_FAILED(rc)) { error = true; break; }
 
-        // 等待 ok
         rc = wait_ok(g_dev, GCODE_OK_TIMEOUT);
-        if (R_FAILED(rc)) {
-            error = true;
-            break;
-        }
+        if (R_FAILED(rc)) { error = true; break; }
 
         line_num++;
         mutexLock(&g_status_mutex);
         g_status.lines_sent = line_num;
-        g_status.progress_percent = (line_num * 100) / total_lines;
+        if (total_lines > 0)
+            g_status.progress_percent = (line_num * 100) / total_lines;
         mutexUnlock(&g_status_mutex);
 
-        // 放一点 CPU 时间给其他任务
-        svcSleepThread(1000000ULL); // 1ms
+        svcSleepThread(1000000ULL);
     }
 
     fclose(fp);
@@ -138,9 +123,9 @@ static void print_thread_func(void *arg) {
     mutexLock(&g_status_mutex);
     if (g_cancel) {
         g_status.state = PRINTER_IDLE;
-        ch340_send(g_dev, "M112\n", 5);      // 紧急停止
-        ch340_send(g_dev, "M104 S0\n", 8);   // 关喷头
-        ch340_send(g_dev, "M140 S0\n", 8);   // 关热床
+        ch340_send(g_dev, "M112\n", 5);
+        ch340_send(g_dev, "M104 S0\n", 8);
+        ch340_send(g_dev, "M140 S0\n", 8);
         g_cancel = false;
     } else if (error) {
         g_status.state = PRINTER_ERROR;
@@ -155,23 +140,29 @@ static void print_thread_func(void *arg) {
 // ============================================================
 Result gcode_start_print(Ch340Device *dev, const char *file_path) {
     if (!dev->connected) return MAKERESULT(Module_Libnx, 1);
-    if (g_status.state == PRINTER_PRINTING) return MAKERESULT(225, 1);
-
+    mutexLock(&g_status_mutex);
+    if (g_status.state == PRINTER_PRINTING) {
+        mutexUnlock(&g_status_mutex);
+        return MAKERESULT(225, 1);
+    }
     g_dev = dev;
     strncpy(g_file_path, file_path, sizeof(g_file_path) - 1);
     g_status.state = PRINTER_PRINTING;
     strncpy(g_status.current_file, file_path, sizeof(g_status.current_file) - 1);
+    mutexUnlock(&g_status_mutex);
 
     Result rc = threadCreate(&g_print_thread, print_thread_func, NULL, NULL, 0x8000, 0x2C, -1);
     if (R_FAILED(rc)) {
+        mutexLock(&g_status_mutex);
         g_status.state = PRINTER_IDLE;
+        mutexUnlock(&g_status_mutex);
         return rc;
     }
+    g_thread_running = true;
     threadStart(&g_print_thread);
     return 0;
 }
 
-// ============================================================
 Result gcode_pause(void) {
     g_paused = true;
     mutexLock(&g_status_mutex);
@@ -190,13 +181,15 @@ Result gcode_resume(void) {
 
 Result gcode_cancel(Ch340Device *dev) {
     g_cancel = true;
-    g_paused = false; // 解除暂停让线程退出
-    threadWaitForExit(&g_print_thread);
-    threadClose(&g_print_thread);
+    g_paused = false;
+    if (g_thread_running) {
+        threadWaitForExit(&g_print_thread);
+        threadClose(&g_print_thread);
+        g_thread_running = false;
+    }
     return 0;
 }
 
-// ============================================================
 Result gcode_send_raw(Ch340Device *dev, const char *gcode_line) {
     if (!dev->connected) return MAKERESULT(Module_Libnx, 1);
     char buf[GCODE_LINE_MAX + 2];
@@ -204,13 +197,11 @@ Result gcode_send_raw(Ch340Device *dev, const char *gcode_line) {
     return ch340_send(dev, buf, strlen(buf));
 }
 
-// ============================================================
 Result gcode_query_temp(Ch340Device *dev, PrinterTemp *temp) {
     if (!dev->connected) return MAKERESULT(Module_Libnx, 1);
     Result rc = ch340_send(dev, "M105\n", 5);
     if (R_FAILED(rc)) return rc;
 
-    // 等待回应
     char buf[128];
     size_t received;
     rc = ch340_recv(dev, buf, sizeof(buf) - 1, 2000, &received);
@@ -218,11 +209,8 @@ Result gcode_query_temp(Ch340Device *dev, PrinterTemp *temp) {
 
     buf[received] = '\0';
     float na = 0, nt = 0, ba = 0, bt = 0;
-    // 解析 "ok T:23.5 /0.0 B:22.1 /0.0"
     char *tpos = strstr(buf, "T:");
-    if (tpos) {
-        sscanf(tpos, "T:%f /%f B:%f /%f", &na, &nt, &ba, &bt);
-    }
+    if (tpos) sscanf(tpos, "T:%f /%f B:%f /%f", &na, &nt, &ba, &bt);
 
     mutexLock(&g_status_mutex);
     g_status.temp.nozzle_actual = na;
@@ -231,7 +219,6 @@ Result gcode_query_temp(Ch340Device *dev, PrinterTemp *temp) {
     g_status.temp.bed_target = bt;
     memcpy(temp, &g_status.temp, sizeof(PrinterTemp));
     mutexUnlock(&g_status_mutex);
-
     return 0;
 }
 
@@ -249,12 +236,18 @@ PrinterStatus *gcode_get_status(void) {
     return &g_status;
 }
 
+void gcode_get_status_safe(PrinterStatus *out) {
+    mutexLock(&g_status_mutex);
+    memcpy(out, &g_status, sizeof(PrinterStatus));
+    mutexUnlock(&g_status_mutex);
+}
+
 void gcode_update(Ch340Device *dev) {
+    mutexLock(&g_status_mutex);
     if (dev && dev->connected) {
-        if (g_status.state == PRINTER_OFFLINE) {
-            g_status.state = PRINTER_IDLE;
-        }
+        if (g_status.state == PRINTER_OFFLINE) g_status.state = PRINTER_IDLE;
     } else {
         g_status.state = PRINTER_OFFLINE;
     }
+    mutexUnlock(&g_status_mutex);
 }
