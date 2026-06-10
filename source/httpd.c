@@ -15,6 +15,7 @@
 
 static Ch340Device *g_printer = NULL;
 static volatile bool g_running = false;
+static bool g_server_started = false;
 static Thread g_server_thread;
 static char g_ip_str[32] = "0.0.0.0";
 static int g_sock = -1;
@@ -68,7 +69,6 @@ static void parse_path(char *req, char *path, size_t max) {
     path[len] = '\0';
 }
 
-// Case-insensitive header lookup
 static const char *find_header(const char *req, const char *name) {
     const char *hd_end = strstr(req, "\r\n\r\n");
     if (!hd_end) hd_end = req + strlen(req);
@@ -110,12 +110,18 @@ static void json_escape(char *dst, const char *src, size_t dst_size) {
     dst[j] = '\0';
 }
 
+// Block mutating ops during active print (F1, I6)
+static bool is_printer_busy(void) {
+    PrinterStatus st;
+    gcode_get_status_safe(&st);
+    return (st.state == PRINTER_PRINTING || st.state == PRINTER_PAUSED);
+}
+
 static void handle_api(int client, Ch340Device *dev, char *method, char *path) {
     PrinterStatus st;
     gcode_get_status_safe(&st);
     const char *resp = api_buf;
 
-    // P0: mutating ops require POST (SEC-003 CSRF)
     bool is_get = (strcmp(method, "GET") == 0);
     bool is_mutating = (strncmp(path, "/api/status", 11) != 0);
     if (is_get && is_mutating) {
@@ -136,6 +142,11 @@ static void handle_api(int client, Ch340Device *dev, char *method, char *path) {
             escaped_file);
     }
     else if (strcmp(path, "/api/home") == 0) {
+        if (is_printer_busy()) {
+            snprintf(api_buf, sizeof(api_buf), JSON_ERR, "Printer is busy");
+            send_response(client, 409, "application/json", api_buf);
+            return;
+        }
         gcode_home(dev);
         snprintf(api_buf, sizeof(api_buf), JSON_OK, "Homed");
     }
@@ -152,6 +163,11 @@ static void handle_api(int client, Ch340Device *dev, char *method, char *path) {
         snprintf(api_buf, sizeof(api_buf), JSON_OK, "Cancelled");
     }
     else if (strncmp(path, "/api/move", 9) == 0) {
+        if (is_printer_busy()) {
+            snprintf(api_buf, sizeof(api_buf), JSON_ERR, "Printer is busy");
+            send_response(client, 409, "application/json", api_buf);
+            return;
+        }
         float dx = 0, dy = 0, dz = 0;
         bool has_valid = false;
         char *qs = strchr(path, '?');
@@ -185,16 +201,19 @@ static void handle_api(int client, Ch340Device *dev, char *method, char *path) {
     send_response(client, 200, "application/json", resp);
 }
 
-// P0: fixed multipart parsing (MOW-002, I-02)
-static void handle_upload(int client, const char *req_body, int body_len,
-                          const char *boundary_str) {
+// Streaming upload: loop recv→fwrite (war-004), check I/O (I5), atomic rename (sys-001)
+static void handle_upload(int client, char *req_buf, int first_recvd,
+                          int body_len, const char *boundary_str) {
+    (void)boundary_str;
     if (body_len > HTTP_UPLOAD_MAX_MB * 1024 * 1024) {
-        snprintf(api_buf, sizeof(api_buf), JSON_ERR, "File too large (max 100MB)");
+        snprintf(api_buf, sizeof(api_buf), JSON_ERR, "File too large");
         send_response(client, 413, "application/json", api_buf);
         return;
     }
 
-    const char *fn = strstr(req_body, "filename=\"");
+    static char stream_buf[8192];
+
+    const char *fn = strstr(req_buf, "filename=\"");
     char filename[256] = "upload.gcode";
     if (fn) {
         fn += 10;
@@ -216,45 +235,75 @@ static void handle_upload(int client, const char *req_body, int body_len,
     if (safe != filename) memmove(filename, safe, strlen(safe) + 1);
     if (filename[0] == '\0') strcpy(filename, "upload.gcode");
 
-    // Find file data: skip HTTP headers, then skip part headers
-    const char *data_start = NULL;
-    const char *http_body = strstr(req_body, "\r\n\r\n");
-    if (http_body) {
-        const char *after_boundary = http_body + 4;
-        data_start = strstr(after_boundary, "\r\n\r\n");
-        if (data_start) data_start += 4;
-    }
-    if (!data_start) {
-        snprintf(api_buf, sizeof(api_buf), JSON_ERR, "Cannot parse upload");
-        send_response(client, 400, "application/json", api_buf);
-        return;
-    }
-
-    // Find end of file data using full boundary string
-    int data_len = body_len - (int)(data_start - req_body);
-    if (boundary_str && boundary_str[0]) {
-        char end_marker[140];
-        snprintf(end_marker, sizeof(end_marker), "\r\n--%s--", boundary_str);
-        const char *file_end = strstr(data_start, end_marker);
-        if (file_end) data_len = (int)(file_end - data_start);
-    }
-
-    char filepath[320];
+    char filepath[320], tmppath[330];
     snprintf(filepath, sizeof(filepath), "sdmc:/switch/gcode/%s", filename);
+    snprintf(tmppath, sizeof(tmppath), "sdmc:/switch/gcode/%s.tmp", filename);
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/gcode", 0777);
-    FILE *fp = fopen(filepath, "wb");
+
+    FILE *fp = fopen(tmppath, "wb");
     if (!fp) {
         snprintf(api_buf, sizeof(api_buf), JSON_ERR, "Cannot create file");
         send_response(client, 500, "application/json", api_buf);
         return;
     }
-    fwrite(data_start, 1, data_len, fp);
-    fclose(fp);
-    gcode_start_print(g_printer, filepath);
+
+    // Find data start: skip HTTP headers, then part headers
+    const char *data_start = NULL;
+    const char *http_body = strstr(req_buf, "\r\n\r\n");
+    if (http_body) {
+        const char *after = http_body + 4;
+        data_start = strstr(after, "\r\n\r\n");
+        if (data_start) data_start += 4;
+    }
+    if (!data_start) data_start = req_buf;
+
+    // Write first chunk
+    int first_data = first_recvd - (int)(data_start - req_buf);
+    if (first_data > 0 && first_data <= first_recvd) {
+        if (fwrite(data_start, 1, first_data, fp) != (size_t)first_data) {
+            fclose(fp); remove(tmppath);
+            snprintf(api_buf, sizeof(api_buf), JSON_ERR, "SD write failed");
+            send_response(client, 500, "application/json", api_buf);
+            return;
+        }
+    }
+
+    // Stream remaining (war-004)
+    int total = first_data > 0 ? first_data : 0;
+    while (total < body_len) {
+        int to_read = body_len - total;
+        if (to_read > (int)sizeof(stream_buf)) to_read = (int)sizeof(stream_buf);
+        int n = recv(client, stream_buf, to_read, 0);
+        if (n <= 0) break;
+        if (fwrite(stream_buf, 1, n, fp) != (size_t)n) {
+            fclose(fp); remove(tmppath);
+            snprintf(api_buf, sizeof(api_buf), JSON_ERR, "SD write failed");
+            send_response(client, 500, "application/json", api_buf);
+            return;
+        }
+        total += n;
+    }
+
+    if (fclose(fp) != 0) {
+        remove(tmppath);
+        snprintf(api_buf, sizeof(api_buf), JSON_ERR, "SD flush failed");
+        send_response(client, 500, "application/json", api_buf);
+        return;
+    }
+
+    rename(tmppath, filepath);
+    svcSleepThread(50000000ULL);
+
+    Result rc = gcode_start_print(g_printer, filepath);
+    if (R_FAILED(rc)) {
+        snprintf(api_buf, sizeof(api_buf), JSON_ERR, "Printer is busy");
+        send_response(client, 409, "application/json", api_buf);
+        return;
+    }
     snprintf(api_buf, sizeof(api_buf),
         "{\"ok\":true,\"msg\":\"Uploaded: %s\",\"lines\":%d}",
-        filename, data_len / GCODE_EST_BYTES_PER_LINE);
+        filename, total / GCODE_EST_BYTES_PER_LINE);
     send_response(client, 200, "application/json", api_buf);
 }
 
@@ -297,8 +346,6 @@ static void server_thread_func(void *arg) {
         socklen_t cl = sizeof(ca);
         int client = accept(g_sock, (struct sockaddr*)&ca, &cl);
         if (client < 0) { if (!g_running) break; continue; }
-
-        // P0: client socket recv timeout (I-03 Slowloris)
         setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         int recvd = recv(client, req_buf, sizeof(req_buf) - 1, 0);
@@ -316,27 +363,15 @@ static void server_thread_func(void *arg) {
             handle_api(client, g_printer, method, path);
         }
         else if (strcmp(path, "/upload") == 0) {
-            // P0: case-insensitive Content-Length with strtol (S-04, SEC-008)
             const char *cl = find_header(req_buf, "Content-Length");
-            const char *hd_end = strstr(req_buf, "\r\n\r\n");
             int body_len = 0;
             if (cl) {
                 char *endp = NULL;
                 long val = strtol(cl, &endp, 10);
-                if (val > 0 && val < HTTP_REQ_BUF_SIZE && endp != cl)
-                    body_len = (int)val;
-            }
-            if (hd_end && body_len > 0) {
-                int hdr_len = (int)(hd_end - req_buf) + 4;
-                int body_got = recvd - hdr_len;
-                int remain = body_len - body_got;
-                if (remain > 0 && remain < (int)(sizeof(req_buf) - recvd)) {
-                    int more = recv(client, req_buf + recvd, remain, 0);
-                    if (more > 0) recvd += more;
-                }
+                if (val > 0 && endp != cl) body_len = (int)val;
             }
             const char *bd_str = extract_boundary(req_buf);
-            handle_upload(client, req_buf, recvd, bd_str);
+            handle_upload(client, req_buf, recvd, body_len, bd_str);
         }
         else {
             snprintf(api_buf, sizeof(api_buf), JSON_ERR, "404 Not Found");
@@ -351,17 +386,22 @@ static void server_thread_func(void *arg) {
 Result httpd_init(void) { return 0; }
 
 Result httpd_start(Ch340Device *printer_dev) {
+    if (g_running) return 0;
     g_printer = printer_dev;
     g_running = true;
     Result rc = threadCreate(&g_server_thread, server_thread_func, NULL, NULL,
                              0x20000, 0x2B, -1);
     if (R_FAILED(rc)) { g_running = false; return rc; }
+    g_server_started = true;
     threadStart(&g_server_thread);
     return 0;
 }
 
 void httpd_stop(void) {
     g_running = false;
-    threadWaitForExit(&g_server_thread);
-    threadClose(&g_server_thread);
+    if (g_server_started) {
+        threadWaitForExit(&g_server_thread);
+        threadClose(&g_server_thread);
+        g_server_started = false;
+    }
 }
