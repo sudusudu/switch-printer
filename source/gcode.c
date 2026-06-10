@@ -1,4 +1,5 @@
 #include <stdatomic.h>
+#include <math.h>
 #include "gcode.h"
 #include <string.h>
 #include <stdio.h>
@@ -14,7 +15,6 @@ static Thread g_print_thread;
 static Ch340Device *g_dev = NULL;
 static char g_file_path[256];
 
-// ============================================================
 Result gcode_init(void) {
     mutexInit(&g_status_mutex);
     memset(&g_status, 0, sizeof(g_status));
@@ -22,15 +22,16 @@ Result gcode_init(void) {
     return 0;
 }
 
-// ============================================================
-// 等待打印机返回 "ok"（正确处理 Marlin "ok T:" 温度+确认响应）
-// ============================================================
+// wait for printer "ok" response, properly handling Marlin "ok T:" format
+// P0: check g_cancel each iteration for fast cancel exit (MOW-005)
 static Result wait_ok(Ch340Device *dev, u64 timeout_ms) {
     char buf[128];
     size_t received;
     u64 deadline = armGetSystemTick() + armNsToTicks(timeout_ms * 1000000ULL);
 
     while (armGetSystemTick() < deadline) {
+        if (atomic_load(&g_cancel)) return MAKERESULT(Module_Libnx, 5);
+
         Result rc = ch340_recv(dev, buf, sizeof(buf) - 1, 100, &received);
         if (R_FAILED(rc)) {
             if (rc == MAKERESULT(0xEA01, 0)) continue;
@@ -38,19 +39,20 @@ static Result wait_ok(Ch340Device *dev, u64 timeout_ms) {
         }
         if (received > 0) {
             buf[received] = '\0';
-            // 先解析温度——"ok T:..." 中 T: 必须在 ok 检查之前处理
             char *tpos = strstr(buf, "T:");
             if (tpos) {
                 float na = 0, nt = 0, ba = 0, bt = 0;
-                sscanf(tpos, "T:%f /%f B:%f /%f", &na, &nt, &ba, &bt);
-                mutexLock(&g_status_mutex);
-                g_status.temp.nozzle_actual = na;
-                g_status.temp.nozzle_target = nt;
-                g_status.temp.bed_actual = ba;
-                g_status.temp.bed_target = bt;
-                mutexUnlock(&g_status_mutex);
+                int n = sscanf(tpos, "T:%f /%f B:%f /%f", &na, &nt, &ba, &bt);
+                // P0: check sscanf return + filter NaN/Inf (MOW-008, I-01)
+                if (n >= 1 && isfinite(na) && isfinite(nt) && isfinite(ba) && isfinite(bt)) {
+                    mutexLock(&g_status_mutex);
+                    g_status.temp.nozzle_actual = na;
+                    g_status.temp.nozzle_target = nt;
+                    g_status.temp.bed_actual = ba;
+                    g_status.temp.bed_target = bt;
+                    mutexUnlock(&g_status_mutex);
+                }
             }
-            // 检查 "ok"（可以是 "ok"、"ok\n"、"ok "、"ok T:..."）
             if (buf[0] == 'o' && buf[1] == 'k' &&
                 (buf[2] == '\0' || buf[2] == '\n' || buf[2] == '\r' || buf[2] == ' '))
                 return 0;
@@ -59,15 +61,15 @@ static Result wait_ok(Ch340Device *dev, u64 timeout_ms) {
     return MAKERESULT(Module_Libnx, 5);
 }
 
-// ============================================================
-// 打印线程主函数
-// ============================================================
 static void print_thread_func(void *arg) {
+    (void)arg;
     FILE *fp = fopen(g_file_path, "r");
     if (!fp) {
         mutexLock(&g_status_mutex);
         g_status.state = PRINTER_ERROR;
         mutexUnlock(&g_status_mutex);
+        // P0: clear g_thread_running on fopen failure (SEC-006)
+        atomic_store(&g_thread_running, false);
         return;
     }
 
@@ -122,12 +124,15 @@ static void print_thread_func(void *arg) {
     mutexLock(&g_status_mutex);
     if (atomic_load(&g_cancel)) {
         g_status.state = PRINTER_IDLE;
-        ch340_send(g_dev, "M112\n", 5);
-        ch340_send(g_dev, "M104 S0\n", 8);
-        ch340_send(g_dev, "M140 S0\n", 8);
+        (void)ch340_send(g_dev, "M112\n", 5);
+        (void)ch340_send(g_dev, "M104 S0\n", 8);
+        (void)ch340_send(g_dev, "M140 S0\n", 8);
         atomic_store(&g_cancel, false);
     } else if (error) {
         g_status.state = PRINTER_ERROR;
+        // P0: best-effort heater shutdown on error (SEC-007)
+        (void)ch340_send(g_dev, "M104 S0\n", 8);
+        (void)ch340_send(g_dev, "M140 S0\n", 8);
     } else {
         g_status.state = PRINTER_IDLE;
         g_status.progress_percent = 100;
@@ -137,21 +142,27 @@ static void print_thread_func(void *arg) {
     atomic_store(&g_thread_running, false);
 }
 
-// ============================================================
 Result gcode_start_print(Ch340Device *dev, const char *file_path) {
     if (!dev->connected) return MAKERESULT(Module_Libnx, 1);
+
+    // P0: reject if already running or paused (MOW-001)
+    if (atomic_load(&g_thread_running)) return MAKERESULT(225, 1);
+
     mutexLock(&g_status_mutex);
-    if (g_status.state == PRINTER_PRINTING) {
+    if (g_status.state == PRINTER_PRINTING || g_status.state == PRINTER_PAUSED) {
         mutexUnlock(&g_status_mutex);
         return MAKERESULT(225, 1);
     }
     g_dev = dev;
     strncpy(g_file_path, file_path, sizeof(g_file_path) - 1);
+    g_file_path[sizeof(g_file_path) - 1] = '\0';
     g_status.state = PRINTER_PRINTING;
     strncpy(g_status.current_file, file_path, sizeof(g_status.current_file) - 1);
+    g_status.current_file[sizeof(g_status.current_file) - 1] = '\0';
     mutexUnlock(&g_status_mutex);
 
-    Result rc = threadCreate(&g_print_thread, print_thread_func, NULL, NULL, 0x10000, 0x30, -1);
+    Result rc = threadCreate(&g_print_thread, print_thread_func, NULL, NULL,
+                             0x20000, 0x30, -1);
     if (R_FAILED(rc)) {
         mutexLock(&g_status_mutex);
         g_status.state = PRINTER_IDLE;
@@ -180,9 +191,11 @@ Result gcode_resume(void) {
 }
 
 Result gcode_cancel(Ch340Device *dev) {
+    (void)dev;
     atomic_store(&g_cancel, true);
     atomic_store(&g_paused, false);
     if (atomic_load(&g_thread_running)) {
+        // P0: wait_ok checks g_cancel for quick exit, no 30s block
         threadWaitForExit(&g_print_thread);
         threadClose(&g_print_thread);
         atomic_store(&g_thread_running, false);
@@ -198,6 +211,7 @@ Result gcode_send_raw(Ch340Device *dev, const char *gcode_line) {
 }
 
 Result gcode_query_temp(Ch340Device *dev, PrinterTemp *temp) {
+    if (!dev || !temp) return MAKERESULT(Module_Libnx, 1);
     if (!dev->connected) return MAKERESULT(Module_Libnx, 1);
     Result rc = ch340_send(dev, "M105\n", 5);
     if (R_FAILED(rc)) return rc;
@@ -210,7 +224,13 @@ Result gcode_query_temp(Ch340Device *dev, PrinterTemp *temp) {
     buf[received] = '\0';
     float na = 0, nt = 0, ba = 0, bt = 0;
     char *tpos = strstr(buf, "T:");
-    if (tpos) sscanf(tpos, "T:%f /%f B:%f /%f", &na, &nt, &ba, &bt);
+    if (tpos) {
+        int n = sscanf(tpos, "T:%f /%f B:%f /%f", &na, &nt, &ba, &bt);
+        if (n < 1 || !isfinite(na)) na = 0;
+        if (n < 2 || !isfinite(nt)) nt = 0;
+        if (n < 3 || !isfinite(ba)) ba = 0;
+        if (n < 4 || !isfinite(bt)) bt = 0;
+    }
 
     mutexLock(&g_status_mutex);
     g_status.temp.nozzle_actual = na;
@@ -226,9 +246,24 @@ Result gcode_home(Ch340Device *dev) {
     return gcode_send_raw(dev, "G28");
 }
 
+// P0: gcode_move uses G91 relative positioning, only sends non-zero axes
+// Boundary-checked against PRINTER_BED_* (war-NEW-001, war-F01)
 Result gcode_move(Ch340Device *dev, float x, float y, float z, float feedrate) {
+    if (!dev || !dev->connected) return MAKERESULT(Module_Libnx, 1);
+
+    if (x < -PRINTER_BED_X || x > PRINTER_BED_X ||
+        y < -PRINTER_BED_Y || y > PRINTER_BED_Y ||
+        z < -PRINTER_BED_Z || z > PRINTER_BED_Z)
+        return MAKERESULT(225, 2);
+
     char buf[128];
-    snprintf(buf, sizeof(buf), "G1 X%.1f Y%.1f Z%.1f F%.0f", x, y, z, feedrate);
+    int pos = snprintf(buf, sizeof(buf), "G91\nG1");
+    if (x != 0.0f) pos += snprintf(buf + pos, sizeof(buf) - pos, " X%.1f", x);
+    if (y != 0.0f) pos += snprintf(buf + pos, sizeof(buf) - pos, " Y%.1f", y);
+    if (z != 0.0f) pos += snprintf(buf + pos, sizeof(buf) - pos, " Z%.1f", z);
+    if (feedrate > 0) snprintf(buf + pos, sizeof(buf) - pos, " F%.0f", feedrate);
+    snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "\nG90");
+
     return gcode_send_raw(dev, buf);
 }
 
@@ -238,12 +273,15 @@ void gcode_get_status_safe(PrinterStatus *out) {
     mutexUnlock(&g_status_mutex);
 }
 
+// P0: don't overwrite PRINTER_ERROR (MOW-006)
 void gcode_update(Ch340Device *dev) {
     mutexLock(&g_status_mutex);
     if (dev && dev->connected) {
-        if (g_status.state == PRINTER_OFFLINE) g_status.state = PRINTER_IDLE;
+        if (g_status.state == PRINTER_OFFLINE)
+            g_status.state = PRINTER_IDLE;
     } else {
-        g_status.state = PRINTER_OFFLINE;
+        if (g_status.state != PRINTER_ERROR)
+            g_status.state = PRINTER_OFFLINE;
     }
     mutexUnlock(&g_status_mutex);
 }
