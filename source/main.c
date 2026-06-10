@@ -33,10 +33,10 @@ static const char *blk[9] = {
     "\xe2\x96\x88"   // U+2588
 };
 
-// High-res block element bar: width w chars, value v/max
 static void blkbar(int w, float v, float max, const char *hi, const char *lo) {
     float r = (max > 0) ? v / max : 0;
-    if (r < 0) r = 0; if (r > 1) r = 1;
+    if (r < 0) r = 0;
+    if (r > 1) r = 1;
     int full = (int)(r * w);
     int frac = ((int)(r * w * 8)) % 8;
     printf("%s", hi);
@@ -48,7 +48,6 @@ static void blkbar(int w, float v, float max, const char *hi, const char *lo) {
     printf(CLR_RST);
 }
 
-// Temperature color gradient
 static const char *tclr(float t) {
     if (t >= 190) return CLR_RED;
     if (t >= 120) return CLR_YEL;
@@ -56,20 +55,17 @@ static const char *tclr(float t) {
     return CLR_CYAN;
 }
 
-// Pad remaining 78-col content area and close right border
 static void end78(int used) {
     for (int i = used; i < 78; i++) printf(" ");
     printf("\xe2\x94\x82\n");
 }
 
-// Horizontal separator: ├──...──┤
 static void hr(void) {
     printf("\xe2\x94\x9c");
     for (int i = 0; i < 78; i++) printf("\xe2\x94\x80");
     printf("\xe2\x94\xa4\n");
 }
 
-// ============================================================
 static void draw_ui(Ch340Device *dev) {
     consoleClear();
     PrinterStatus st;
@@ -89,7 +85,6 @@ static void draw_ui(Ch340Device *dev) {
     bool wf = (wifi_ip[0] != '0' && wifi_ip[0] != '\0');
     bool usb = dev->connected;
 
-    // === Title bar ===
     printf(CLR_BOLD CLR_CYAN);
     printf("\xe2\x94\x8c");
     for (int i = 0; i < 78; i++) printf("\xe2\x94\x80");
@@ -97,7 +92,6 @@ static void draw_ui(Ch340Device *dev) {
     printf("\xe2\x94\x82  \xf0\x9f\x8e\xae Switch 3D Printer v1.0");
     end78(30);
 
-    // === Connection status ===
     hr();
     printf("\xe2\x94\x82  %s\xe2\x97\x8f %s" CLR_RST "  %s\xe2\x97\x8f %s" CLR_RST,
            usb ? CLR_GRN : CLR_DIM,
@@ -108,10 +102,8 @@ static void draw_ui(Ch340Device *dev) {
     printf("%s%s" CLR_RST, sc[s], sn[s]);
     end78(78);
 
-    // === Temperature ===
     hr();
 
-    // Nozzle
     printf("\xe2\x94\x82  " CLR_BOLD "Nozzle" CLR_RST " ");
     blkbar(30, st.temp.nozzle_actual, 300,
            tclr(st.temp.nozzle_actual), CLR_DIM);
@@ -127,7 +119,6 @@ static void draw_ui(Ch340Device *dev) {
     else printf(" ");
     end78(78);
 
-    // Bed
     printf("\xe2\x94\x82  " CLR_BOLD "Bed   " CLR_RST " ");
     blkbar(30, st.temp.bed_actual, 120,
            tclr(st.temp.bed_actual * 2.5f), CLR_DIM);
@@ -143,7 +134,6 @@ static void draw_ui(Ch340Device *dev) {
     else printf(" ");
     end78(78);
 
-    // === Progress ===
     hr();
     if (s == 2 || s == 3) {
         printf("\xe2\x94\x82  " CLR_BOLD "Prog" CLR_RST "  ");
@@ -165,7 +155,6 @@ static void draw_ui(Ch340Device *dev) {
         printf("\xe2\x94\x82"); end78(0);
     }
 
-    // === JOG Controls ===
     hr();
     printf("\xe2\x94\x82                          " CLR_BOLD "\xe2\x96\xb2 Y+" CLR_RST "                                \xe2\x94\x82\n");
     printf("\xe2\x94\x82                " CLR_BOLD "\xe2\x97\x84 X-" CLR_RST "   " CLR_BOLD "\xe2\x97\x86 HOME" CLR_RST "   " CLR_BOLD "X+ \xe2\x96\xba" CLR_RST "                \xe2\x94\x82\n");
@@ -174,7 +163,6 @@ static void draw_ui(Ch340Device *dev) {
     printf("\xe2\x94\x82  " CLR_BOLD "Z+1" CLR_RST "  " CLR_BOLD "Z Home" CLR_RST "  " CLR_BOLD "Z-1" CLR_RST "        Step: " CLR_BOLD "10" CLR_RST " mm");
     end78(60);
 
-    // === Key Hints ===
     hr();
     printf("\xe2\x94\x82  " CLR_BOLD "[+]" CLR_RST "Connect  " CLR_BOLD "[-]" CLR_RST "Disconnect  ");
     if (s == 2) printf(CLR_BOLD "[A]" CLR_RST "Pause  ");
@@ -183,7 +171,6 @@ static void draw_ui(Ch340Device *dev) {
     printf(CLR_BOLD "[X]" CLR_RST "Exit");
     end78(66);
 
-    // === Bottom ===
     printf("\xe2\x94\x94");
     for (int i = 0; i < 78; i++) printf("\xe2\x94\x80");
     printf("\xe2\x94\x98\n" CLR_RST);
@@ -195,7 +182,6 @@ static void draw_ui(Ch340Device *dev) {
     }
 }
 
-// ============================================================
 int main(int argc, char **argv) {
     Result rc;
 
