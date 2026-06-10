@@ -12,16 +12,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Dump USB struct
-        run: |
-          export DEVKITPRO=/opt/devkitpro
-          echo "=== UsbHsInterface ==="
-          cat $DEVKITPRO/libnx/include/switch/services/usbhs.h 2>/dev/null | head -200
-          echo "=== grep inf / pathstr / device ==="
-          grep -n "inf;\|pathstr\|device" $DEVKITPRO/libnx/include/switch/services/usbhs.h 2>/dev/null | head -30
-
       - name: Build
         run: |
           export DEVKITPRO=/opt/devkitpro
           export PATH="$DEVKITPRO/devkitA64/bin:$DEVKITPRO/tools/bin:$PATH"
-          make 2>&1 | head -30
+          make clean 2>/dev/null || true
+          make 2>&1
+
+      - name: Upload NRO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: switch_printer
+          path: build/switch_printer.nro
+          if-no-files-found: error
