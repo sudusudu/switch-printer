@@ -6,6 +6,7 @@
 static Mutex g_init_mutex;
 static bool  g_usb_ready = false;
 
+// Caller: single-threaded only (called from main before any threads start)
 static void init_mutex_once(void) {
     static bool done = false;
     if (!done) { mutexInit(&g_init_mutex); done = true; }
@@ -54,10 +55,16 @@ static Result ch340_init_chip(Ch340Device *dev) {
     return ch340_set_baud(dev, CH340_BAUDRATE);
 }
 
+// P0: don't memset over mutex — caller must mutexInit before first connect
 Result ch340_connect(Ch340Device *dev) {
     if (!g_usb_ready) return MAKERESULT(Module_Libnx, 1);
-    memset(dev, 0, sizeof(Ch340Device));
-    mutexInit(&dev->mutex);
+
+    dev->if_session = (UsbHsClientIfSession){0};
+    dev->ep_out = (UsbHsClientEpSession){0};
+    dev->ep_in = (UsbHsClientEpSession){0};
+    dev->connected = false;
+    memset(dev->tx_buf, 0, CH340_BUF_SIZE);
+    memset(dev->rx_buf, 0, CH340_BUF_SIZE);
 
     s32 total = 0;
     Result rc = usbHsQueryAvailableInterfaces(NULL, NULL, 0, &total);
@@ -96,35 +103,29 @@ Result ch340_connect(Ch340Device *dev) {
     }
 
     if (out_desc) {
-        rc = usbHsIfOpenUsbEp(&dev->if_session, &dev->ep_out, 8, 0x1000, out_desc);
+        rc = usbHsIfOpenUsbEp(&dev->if_session, &dev->ep_out, 8, CH340_BUF_SIZE, out_desc);
     } else {
         struct usb_endpoint_descriptor fake_out = {0};
-        fake_out.bLength = 7;
-        fake_out.bDescriptorType = 5;
-        fake_out.bEndpointAddress = 0x02;
-        fake_out.bmAttributes = 2;
-        fake_out.wMaxPacketSize = 64;
-        rc = usbHsIfOpenUsbEp(&dev->if_session, &dev->ep_out, 8, 0x1000, &fake_out);
+        fake_out.bLength = 7; fake_out.bDescriptorType = 5;
+        fake_out.bEndpointAddress = 0x02; fake_out.bmAttributes = 2; fake_out.wMaxPacketSize = 64;
+        rc = usbHsIfOpenUsbEp(&dev->if_session, &dev->ep_out, 8, CH340_BUF_SIZE, &fake_out);
     }
     if (R_FAILED(rc)) goto fail;
 
     if (in_desc) {
-        rc = usbHsIfOpenUsbEp(&dev->if_session, &dev->ep_in, 8, 0x1000, in_desc);
+        rc = usbHsIfOpenUsbEp(&dev->if_session, &dev->ep_in, 8, CH340_BUF_SIZE, in_desc);
     } else {
         struct usb_endpoint_descriptor fake_in = {0};
-        fake_in.bLength = 7;
-        fake_in.bDescriptorType = 5;
-        fake_in.bEndpointAddress = 0x82;
-        fake_in.bmAttributes = 2;
-        fake_in.wMaxPacketSize = 64;
-        rc = usbHsIfOpenUsbEp(&dev->if_session, &dev->ep_in, 8, 0x1000, &fake_in);
+        fake_in.bLength = 7; fake_in.bDescriptorType = 5;
+        fake_in.bEndpointAddress = 0x82; fake_in.bmAttributes = 2; fake_in.wMaxPacketSize = 64;
+        rc = usbHsIfOpenUsbEp(&dev->if_session, &dev->ep_in, 8, CH340_BUF_SIZE, &fake_in);
     }
-    if (R_FAILED(rc)) {
-        usbHsEpClose(&dev->ep_out);
-        goto fail;
-    }
+    if (R_FAILED(rc)) { usbHsEpClose(&dev->ep_out); goto fail; }
 
+    // P0: set connected inside mutex (MOW-004, SEC-005 TOCTOU)
+    mutexLock(&dev->mutex);
     dev->connected = true;
+    mutexUnlock(&dev->mutex);
     return 0;
 
 fail:
@@ -142,13 +143,13 @@ void ch340_disconnect(Ch340Device *dev) {
     mutexUnlock(&dev->mutex);
 }
 
+// P0: connected check inside mutex (MOW-004, SEC-005 TOCTOU)
 Result ch340_send(Ch340Device *dev, const void *data, size_t len) {
-    if (!dev->connected) return MAKERESULT(Module_Libnx, 1);
-    if (len > 0x1000) len = 0x1000;
+    if (len > CH340_BUF_SIZE) len = CH340_BUF_SIZE;
 
     mutexLock(&dev->mutex);
+    if (!dev->connected) { mutexUnlock(&dev->mutex); return MAKERESULT(Module_Libnx, 1); }
     memcpy(dev->tx_buf, data, len);
-
     u32 transferred = 0;
     Result rc = usbHsEpPostBuffer(&dev->ep_out, dev->tx_buf, len, &transferred);
     mutexUnlock(&dev->mutex);
@@ -157,14 +158,14 @@ Result ch340_send(Ch340Device *dev, const void *data, size_t len) {
 
 Result ch340_recv(Ch340Device *dev, void *buf, size_t max_len,
                   u64 timeout_ms, size_t *received) {
-    if (!dev->connected) return MAKERESULT(Module_Libnx, 1);
-    if (max_len > 0x1000) max_len = 0x1000;
+    if (!buf || !received) return MAKERESULT(Module_Libnx, 1);
+    if (max_len > CH340_BUF_SIZE) max_len = CH340_BUF_SIZE;
     *received = 0;
 
     mutexLock(&dev->mutex);
+    if (!dev->connected) { mutexUnlock(&dev->mutex); return MAKERESULT(Module_Libnx, 1); }
     u32 transferred = 0;
     Result rc = usbHsEpPostBuffer(&dev->ep_in, dev->rx_buf, max_len, &transferred);
-
     if (R_SUCCEEDED(rc) && transferred > 0 && transferred <= max_len) {
         memcpy(buf, dev->rx_buf, transferred);
         *received = transferred;
