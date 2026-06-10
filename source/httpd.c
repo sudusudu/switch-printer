@@ -37,12 +37,9 @@ const char *httpd_get_auth_token(void) { return g_auth_token; }
 // ============================================================
 static bool check_auth(const char *req_buf) {
     if (g_auth_token[0] == '\0') return true;
-    const char *hdr = strstr(req_buf, "X-Auth-Token:");
-    if (hdr) {
-        hdr += 13;
-        while (*hdr == ' ' || *hdr == '\t') hdr++;
-        if (strncmp(hdr, g_auth_token, 16) == 0) return true;
-    }
+    // 使用 find_header() 做大小写不敏感匹配（HTTP 头名称不区分大小写）
+    const char *hdr = find_header(req_buf, "x-auth-token");
+    if (hdr && strncmp(hdr, g_auth_token, 16) == 0) return true;
     return false;
 }
 
