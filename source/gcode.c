@@ -22,8 +22,6 @@ Result gcode_init(void) {
     return 0;
 }
 
-// wait for printer "ok" response, properly handling Marlin "ok T:" format
-// P0: check g_cancel each iteration for fast cancel exit (MOW-005)
 static Result wait_ok(Ch340Device *dev, u64 timeout_ms) {
     char buf[128];
     size_t received;
@@ -43,7 +41,6 @@ static Result wait_ok(Ch340Device *dev, u64 timeout_ms) {
             if (tpos) {
                 float na = 0, nt = 0, ba = 0, bt = 0;
                 int n = sscanf(tpos, "T:%f /%f B:%f /%f", &na, &nt, &ba, &bt);
-                // P0: check sscanf return + filter NaN/Inf (MOW-008, I-01)
                 if (n >= 1 && isfinite(na) && isfinite(nt) && isfinite(ba) && isfinite(bt)) {
                     mutexLock(&g_status_mutex);
                     g_status.temp.nozzle_actual = na;
@@ -68,7 +65,6 @@ static void print_thread_func(void *arg) {
         mutexLock(&g_status_mutex);
         g_status.state = PRINTER_ERROR;
         mutexUnlock(&g_status_mutex);
-        // P0: clear g_thread_running on fopen failure (SEC-006)
         atomic_store(&g_thread_running, false);
         return;
     }
@@ -95,6 +91,12 @@ static void print_thread_func(void *arg) {
         if (atomic_load(&g_cancel)) break;
 
         size_t len = strlen(line_buf);
+        // P0: detect truncated long lines (war-008) — skip remainder to avoid split commands
+        if (len == GCODE_LINE_MAX - 1 && line_buf[len-1] != '\n' && line_buf[len-1] != '\r') {
+            int c;
+            while ((c = fgetc(fp)) != EOF && c != '\n') {}
+            continue; // skip truncated line
+        }
         while (len > 0 && (line_buf[len-1] == '\n' || line_buf[len-1] == '\r'))
             line_buf[--len] = '\0';
 
@@ -119,6 +121,8 @@ static void print_thread_func(void *arg) {
         svcSleepThread(1000000ULL);
     }
 
+    // P0: check ferror to distinguish EOF from I/O error (war-002)
+    if (ferror(fp)) error = true;
     fclose(fp);
 
     mutexLock(&g_status_mutex);
@@ -130,7 +134,6 @@ static void print_thread_func(void *arg) {
         atomic_store(&g_cancel, false);
     } else if (error) {
         g_status.state = PRINTER_ERROR;
-        // P0: best-effort heater shutdown on error (SEC-007)
         (void)ch340_send(g_dev, "M104 S0\n", 8);
         (void)ch340_send(g_dev, "M140 S0\n", 8);
     } else {
@@ -144,8 +147,6 @@ static void print_thread_func(void *arg) {
 
 Result gcode_start_print(Ch340Device *dev, const char *file_path) {
     if (!dev->connected) return MAKERESULT(Module_Libnx, 1);
-
-    // P0: reject if already running or paused (MOW-001)
     if (atomic_load(&g_thread_running)) return MAKERESULT(225, 1);
 
     mutexLock(&g_status_mutex);
@@ -190,16 +191,14 @@ Result gcode_resume(void) {
     return 0;
 }
 
+// P0: always do cleanup — threadWaitForExit is safe on exited threads (F3 TOCTOU fix)
 Result gcode_cancel(Ch340Device *dev) {
     (void)dev;
     atomic_store(&g_cancel, true);
     atomic_store(&g_paused, false);
-    if (atomic_load(&g_thread_running)) {
-        // P0: wait_ok checks g_cancel for quick exit, no 30s block
-        threadWaitForExit(&g_print_thread);
-        threadClose(&g_print_thread);
-        atomic_store(&g_thread_running, false);
-    }
+    threadWaitForExit(&g_print_thread);
+    threadClose(&g_print_thread);
+    atomic_store(&g_thread_running, false);
     return 0;
 }
 
@@ -246,8 +245,6 @@ Result gcode_home(Ch340Device *dev) {
     return gcode_send_raw(dev, "G28");
 }
 
-// P0: gcode_move uses G91 relative positioning, only sends non-zero axes
-// Boundary-checked against PRINTER_BED_* (war-NEW-001, war-F01)
 Result gcode_move(Ch340Device *dev, float x, float y, float z, float feedrate) {
     if (!dev || !dev->connected) return MAKERESULT(Module_Libnx, 1);
 
@@ -273,7 +270,6 @@ void gcode_get_status_safe(PrinterStatus *out) {
     mutexUnlock(&g_status_mutex);
 }
 
-// P0: don't overwrite PRINTER_ERROR (MOW-006)
 void gcode_update(Ch340Device *dev) {
     mutexLock(&g_status_mutex);
     if (dev && dev->connected) {
