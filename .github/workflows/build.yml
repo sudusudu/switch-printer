@@ -12,6 +12,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Diagnose HID API
+        run: |
+          export DEVKITPRO=/opt/devkitpro
+          HIDH="$DEVKITPRO/libnx/include/switch/services/hid.h"
+          echo "=== hidScanInput / hidKeysDown ==="
+          grep -n "hidScanInput\|hidKeysDown\|CONTROLLER_P1\|KEY_PLUS\|KEY_A\|HidNpadButton" "$HIDH" | head -30
+          echo "=== pad functions ==="
+          grep -n "padUpdate\|padGetButtons\|padConfigure\|padInitialize" "$HIDH" | head -30
+          echo "=== switch.h hid include ==="
+          grep -rn "hid" "$DEVKITPRO/libnx/include/switch/switch.h" 2>/dev/null | head -10
+          echo "=== libnx version ==="
+          cat "$DEVKITPRO/libnx/include/switch/version.h" 2>/dev/null | head -15
+
       - name: Build
         run: |
           export DEVKITPRO=/opt/devkitpro
