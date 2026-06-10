@@ -24,7 +24,6 @@
 #define CLR_BLU_BG "\x1b[44m"
 
 static void draw_bar(const char *label, float actual, float target, float max) {
-    // 温度条：标签 |████░░░░| 实际/目标 °C
     printf("  %-6s ", label);
     int w = 20;
     float ratio = actual / max;
@@ -32,7 +31,6 @@ static void draw_bar(const char *label, float actual, float target, float max) {
     if (ratio > 1) ratio = 1;
     int filled = (int)(ratio * w);
 
-    // 颜色：冷蓝(<40) 暖绿(40-60) 热黄(60-80) 烫红(>80)
     const char *clr = CLR_CYAN;
     if (actual >= 80) clr = CLR_RED;
     else if (actual >= 60) clr = CLR_YEL;
@@ -57,30 +55,25 @@ static void draw_ui(Ch340Device *dev) {
     const char *state_sym[] = {"[x]", "[ ]", "[>]", "[||]", "[!]"};
     int s = (st.state >= 0 && st.state <= 4) ? st.state : 0;
 
-    // 顶栏
     printf(CLR_BOLD CLR_CYAN);
     printf("  ┌──────────────────────────────┐\n");
     printf("  │  🎮 Switch 3D Printer v1.0   │\n");
     printf("  └──────────────────────────────┘\n" CLR_RST);
     printf("\n");
 
-    // 状态行
     printf("  %s%s 状态: %s%s" CLR_RST "\n",
            state_clr[s], state_sym[s], state_str[s],
            (s == 2) ? " ..." : "      ");
 
-    // 温度
     printf("\n");
     printf(CLR_BOLD "  温度" CLR_RST "\n");
     draw_bar("喷头", st.temp.nozzle_actual, st.temp.nozzle_target, 300);
     draw_bar("热床", st.temp.bed_actual, st.temp.bed_target, 120);
 
-    // 分割线
     printf("\n  %s", CLR_DIM);
     for (int i = 0; i < 30; i++) printf("-");
     printf(CLR_RST "\n");
 
-    // 进度
     if (s == 2 || s == 3) {
         printf("\n" CLR_BOLD "  打印进度" CLR_RST "\n");
         printf("  %s\n", st.current_file[0] ? st.current_file : "(无文件)");
@@ -97,12 +90,10 @@ static void draw_ui(Ch340Device *dev) {
         printf("  %d / %d 行\n", st.lines_sent, st.lines_total);
     }
 
-    // 分割线
     printf("\n  %s", CLR_DIM);
     for (int i = 0; i < 30; i++) printf("-");
     printf(CLR_RST "\n\n");
 
-    // 连接信息
     const char *usb_clr = dev->connected ? CLR_GRN : CLR_DIM;
     const char *usb_txt = dev->connected ? "已连接 CH340" : "未连接";
     const char *wifi_ip = httpd_get_ip();
@@ -116,7 +107,6 @@ static void draw_ui(Ch340Device *dev) {
         printf("\n  " CLR_BOLD "→ " CLR_CYAN "http://%s:%d" CLR_RST "\n", wifi_ip, HTTP_PORT);
     }
 
-    // 底部按键提示
     printf("\n\n  %s", CLR_DIM);
     printf("[+]连接  [-]断开  ");
     if (s == 2) printf("[A]暂停  ");
@@ -126,16 +116,14 @@ static void draw_ui(Ch340Device *dev) {
     printf(CLR_BOLD "[X]退出" CLR_RST "\n");
 }
 
-// ============================================================
 int main(int argc, char **argv) {
     Result rc;
 
     consoleInit(NULL);
     socketInitializeDefault();
 
-    // 初始化手柄输入（新版 libnx pad API）
     PadState pad;
-    padConfigureInput(1, HidNpadStyleTag_NpadStandard);
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&pad);
 
     printf("\n" CLR_BOLD CLR_CYAN "  Switch 3D Printer" CLR_RST "\n");
@@ -187,7 +175,6 @@ int main(int argc, char **argv) {
         padUpdate(&pad);
         u64 down = padGetButtonsDown(&pad);
 
-        // + 键：连接
         if ((down & HidNpadButton_Plus) && !printer->connected) {
             consoleClear();
             printf("\n  " CLR_YEL "重新扫描..." CLR_RST "\n");
@@ -201,13 +188,11 @@ int main(int argc, char **argv) {
             }
         }
 
-        // - 键：断开
         if ((down & HidNpadButton_Minus) && printer->connected) {
             httpd_stop();
             ch340_disconnect(printer);
         }
 
-        // A 键：暂停/恢复
         if (down & HidNpadButton_A) {
             PrinterStatus st;
             gcode_get_status_safe(&st);
@@ -215,7 +200,6 @@ int main(int argc, char **argv) {
             else if (st.state == PRINTER_PAUSED) gcode_resume();
         }
 
-        // B 键：取消打印
         if (down & HidNpadButton_B) {
             PrinterStatus st;
             gcode_get_status_safe(&st);
@@ -223,7 +207,6 @@ int main(int argc, char **argv) {
                 gcode_cancel(printer);
         }
 
-        // X 键：退出
         if (down & HidNpadButton_X) break;
 
         gcode_update(printer);
