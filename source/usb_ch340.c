@@ -6,14 +6,14 @@
 static Mutex g_init_mutex;
 static bool  g_usb_ready = false;
 
-// Caller: single-threaded only (called from main before any threads start)
-static void init_mutex_once(void) {
-    static bool done = false;
-    if (!done) { mutexInit(&g_init_mutex); done = true; }
-}
-
 Result ch340_init(void) {
-    init_mutex_once();
+    // 线程安全的懒初始化（外层 Mutex 保护 once 标志）
+    static Mutex once_mutex;
+    static bool once_done = false;
+    mutexLock(&once_mutex);
+    if (!once_done) { mutexInit(&g_init_mutex); once_done = true; }
+    mutexUnlock(&once_mutex);
+
     mutexLock(&g_init_mutex);
     if (g_usb_ready) { mutexUnlock(&g_init_mutex); return 0; }
     Result rc = usbHsInitialize();
@@ -90,10 +90,14 @@ Result ch340_connect(Ch340Device *dev) {
     rc = ch340_init_chip(dev);
     if (R_FAILED(rc)) goto fail;
 
+    // 使用 sizeof 而非硬编码 15 遍历端点描述符数组
     struct usb_endpoint_descriptor *out_desc = NULL;
     struct usb_endpoint_descriptor *in_desc  = NULL;
+    int ep_max = (int)(sizeof(interfaces[0].inf.output_endpoint_descs) /
+                       sizeof(interfaces[0].inf.output_endpoint_descs[0]));
+
     for (s32 idx = 0; idx < limit; idx++) {
-        for (int j = 0; j < 15; j++) {
+        for (int j = 0; j < ep_max; j++) {
             if (interfaces[idx].inf.output_endpoint_descs[j].bEndpointAddress != 0 && !out_desc)
                 out_desc = &interfaces[idx].inf.output_endpoint_descs[j];
             if (interfaces[idx].inf.input_endpoint_descs[j].bEndpointAddress != 0 && !in_desc)

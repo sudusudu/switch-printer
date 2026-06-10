@@ -1,6 +1,7 @@
 #pragma once
 
-// Switch Printer — Mainsail-style Web Dashboard (textContent-safe, POST CSRF-protected)
+// Switch Printer — Mainsault-style Web Dashboard
+// textContent-safe (XSS), POST for mutating APIs (CSRF), X-Auth-Token auth
 // Temperature thresholds must match config.h: 190/120/40, max 300/120
 static const char *WEB_INDEX_HTML =
 "<!DOCTYPE html><html lang=\"zh\"><head>"
@@ -130,21 +131,25 @@ static const char *WEB_INDEX_HTML =
 "<button onclick=\"api('home')\">Z Home</button>"
 "<button onclick=\"move('z',-1)\">Z-1</button></div>"
 "<div class=\"up\">"
-"<input type=\"file\" id=\"gcode-file\" accept=\".gcode,.gco,.nc\">"
+"<input type=\"file\" id=\"gcode-file\" accept=\".gcode,.gco,.nc,.g\">"
 "<button onclick=\"uploadFile()\">Upload & Print</button></div>"
 "<div class=\"lg\" id=\"log\"><span class=\"ts\">--:--:--</span> Waiting for printer...</div>"
-// P0: textContent replaces innerHTML (SEC-004 XSS), POST for mutating APIs (SEC-003 CSRF)
+// P0: textContent replaces innerHTML (XSS), POST for mutating APIs (CSRF), X-Auth-Token auth
 "<script>"
+"AUTH_TOKEN='__TOKEN__';"
 "var prt=0,elt=0;"
 "function api(c){var m=(c==='status')?'GET':'POST';"
-"fetch('/api/'+c,{method:m}).then(function(r){return r.json()}).then(function(d){"
+"var h=new Headers();if(AUTH_TOKEN)h.append('X-Auth-Token',AUTH_TOKEN);"
+"fetch('/api/'+c,{method:m,headers:h}).then(function(r){return r.json()}).then(function(d){"
 "log(d.msg||d.error||c)})}"
-"function move(a,d){fetch('/api/move?axis='+a+'&dist='+d,{method:'POST'})"
+"function move(a,d){var h=new Headers();if(AUTH_TOKEN)h.append('X-Auth-Token',AUTH_TOKEN);"
+"fetch('/api/move?axis='+a+'&dist='+d,{method:'POST',headers:h})"
 ".then(function(r){return r.json()}).then(function(d){log(d.msg)})}"
 "function uploadFile(){var f=document.getElementById('gcode-file').files[0];"
 "if(!f)return;var fd=new FormData();fd.append('file',f);"
 "log('Upload: '+f.name+' ('+(f.size/1e6).toFixed(1)+' MB)');"
-"fetch('/upload',{method:'POST',body:fd}).then(function(r){return r.json()})"
+"var h=new Headers();if(AUTH_TOKEN)h.append('X-Auth-Token',AUTH_TOKEN);"
+"fetch('/upload',{method:'POST',body:fd,headers:h}).then(function(r){return r.json()})"
 ".then(function(d){log(d.msg||d.error)})}"
 // textContent-safe logging (no innerHTML)
 "var lgEl=document.getElementById('log');"
@@ -154,7 +159,7 @@ static const char *WEB_INDEX_HTML =
 "d.appendChild(ts);d.appendChild(document.createTextNode(' '+m));"
 "lgEl.appendChild(d);lgEl.scrollTop=lgEl.scrollHeight;"
 "if(lgEl.children.length>200)lgEl.firstChild.remove()}"
-// Temp ring update (thresholds: 190/120/40, max 300/120 — match config.h)
+// Temp ring update (thresholds: 190/120/40, max 300/120)
 "function updateRing(el,temp,max,elV,elT){var ratio=Math.min(temp/max,1);"
 "var circ=301;var dash=ratio*circ;"
 "el.setAttribute('stroke-dasharray',dash+' '+(circ-dash));"
@@ -202,6 +207,7 @@ static const char *WEB_INDEX_HTML =
 "setInterval(poll,2000);poll();"
 "</script></body></html>";
 
+// JSON 响应模板（参数说明见 httpd.c）
 static const char *JSON_OK     = "{\"ok\":true,\"msg\":\"%s\"}";
 static const char *JSON_ERR    = "{\"ok\":false,\"error\":\"%s\"}";
 static const char *JSON_STATUS =

@@ -15,6 +15,37 @@ static Thread g_print_thread;
 static Ch340Device *g_dev = NULL;
 static char g_file_path[256];
 
+// ============================================================
+// 危险 G-code/M-code 黑名单（大小写不敏感，前缀匹配）
+// ============================================================
+static const char *DANGEROUS_CODES[] = {
+    "M500",  // 保存到 EEPROM（磨损闪存）
+    "M502",  // 恢复出厂设置
+    "M303",  // PID 自整定
+    NULL
+};
+
+static bool is_dangerous_gcode(const char *line) {
+    while (*line == ' ' || *line == '\t' || *line == '\r') line++;
+    if (*line == '\0') return false;
+    for (int i = 0; DANGEROUS_CODES[i] != NULL; i++) {
+        size_t len = strlen(DANGEROUS_CODES[i]);
+        bool match = true;
+        for (size_t j = 0; j < len; j++) {
+            char a = line[j], b = DANGEROUS_CODES[i][j];
+            if (a >= 'a' && a <= 'z') a -= 32;
+            if (b >= 'a' && b <= 'z') b -= 32;
+            if (a != b) { match = false; break; }
+        }
+        if (match) {
+            char c = line[len];
+            if (c == '\0' || c == ' ' || c == '\n' || c == '\r')
+                return true;
+        }
+    }
+    return false;
+}
+
 Result gcode_init(void) {
     mutexInit(&g_status_mutex);
     memset(&g_status, 0, sizeof(g_status));
@@ -91,16 +122,18 @@ static void print_thread_func(void *arg) {
         if (atomic_load(&g_cancel)) break;
 
         size_t len = strlen(line_buf);
-        // P0: detect truncated long lines (war-008) — skip remainder to avoid split commands
         if (len == GCODE_LINE_MAX - 1 && line_buf[len-1] != '\n' && line_buf[len-1] != '\r') {
             int c;
             while ((c = fgetc(fp)) != EOF && c != '\n') {}
-            continue; // skip truncated line
+            continue;
         }
         while (len > 0 && (line_buf[len-1] == '\n' || line_buf[len-1] == '\r'))
             line_buf[--len] = '\0';
 
         if (len == 0 || line_buf[0] == ';') continue;
+
+        // 跳过危险命令
+        if (is_dangerous_gcode(line_buf)) continue;
 
         if (len >= GCODE_LINE_MAX - 2) len = GCODE_LINE_MAX - 3;
         line_buf[len] = '\n'; line_buf[len+1] = '\0';
@@ -121,7 +154,6 @@ static void print_thread_func(void *arg) {
         svcSleepThread(1000000ULL);
     }
 
-    // P0: check ferror to distinguish EOF from I/O error (war-002)
     if (ferror(fp)) error = true;
     fclose(fp);
 
@@ -163,7 +195,7 @@ Result gcode_start_print(Ch340Device *dev, const char *file_path) {
     mutexUnlock(&g_status_mutex);
 
     Result rc = threadCreate(&g_print_thread, print_thread_func, NULL, NULL,
-                             0x20000, 0x30, -1);
+                             PRINT_THREAD_STACK_SIZE, PRINT_THREAD_PRIORITY, THREAD_DEFAULT_CORE);
     if (R_FAILED(rc)) {
         mutexLock(&g_status_mutex);
         g_status.state = PRINTER_IDLE;
@@ -191,7 +223,6 @@ Result gcode_resume(void) {
     return 0;
 }
 
-// P0: always do cleanup — threadWaitForExit is safe on exited threads (F3 TOCTOU fix)
 Result gcode_cancel(Ch340Device *dev) {
     (void)dev;
     atomic_store(&g_cancel, true);
@@ -204,6 +235,11 @@ Result gcode_cancel(Ch340Device *dev) {
 
 Result gcode_send_raw(Ch340Device *dev, const char *gcode_line) {
     if (!dev->connected) return MAKERESULT(Module_Libnx, 1);
+
+    // 检查危险命令
+    if (is_dangerous_gcode(gcode_line))
+        return MAKERESULT(225, 3);
+
     char buf[GCODE_LINE_MAX + 2];
     snprintf(buf, sizeof(buf), "%s\n", gcode_line);
     return ch340_send(dev, buf, strlen(buf));

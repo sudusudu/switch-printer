@@ -20,6 +20,48 @@ static Thread g_server_thread;
 static char g_ip_str[32] = "0.0.0.0";
 static int g_sock = -1;
 
+// API 认证 Token（启动时随机生成，显示在 Switch 屏幕上）
+static char g_auth_token[17] = "";
+
+static void generate_token(void) {
+    u64 rnd;
+    randomGet64(&rnd);
+    snprintf(g_auth_token, sizeof(g_auth_token), "%016llX", (unsigned long long)rnd);
+}
+
+const char *httpd_get_auth_token(void) { return g_auth_token; }
+
+// ============================================================
+// 认证检查：仅通过 X-Auth-Token HTTP 头（不在 URL 中传递，
+// 避免浏览器历史/服务器日志泄露）
+// ============================================================
+static bool check_auth(const char *req_buf) {
+    if (g_auth_token[0] == '\0') return true;
+    const char *hdr = strstr(req_buf, "X-Auth-Token:");
+    if (hdr) {
+        hdr += 13;
+        while (*hdr == ' ' || *hdr == '\t') hdr++;
+        if (strncmp(hdr, g_auth_token, 16) == 0) return true;
+    }
+    return false;
+}
+
+// ============================================================
+// 文件扩展名白名单（ASCII 大小写不敏感）
+// ============================================================
+static bool is_allowed_ext(const char *filename) {
+    const char *ext = strrchr(filename, '.');
+    if (!ext) return false;
+    ext++;
+    const char *allowed[] = {"gcode", "gco", "nc", "g", NULL};
+    for (int i = 0; allowed[i]; i++) {
+        const char *a = allowed[i], *e = ext;
+        while (*a && *e && (*a | 0x20) == (*e | 0x20)) { a++; e++; }
+        if (*a == '\0' && *e == '\0') return true;
+    }
+    return false;
+}
+
 static void update_ip(void) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return;
@@ -43,7 +85,9 @@ static void send_response(int client, int code, const char *ctype, const char *b
         "Content-Type: %s\r\n"
         "Content-Length: %d\r\n"
         "Connection: close\r\n\r\n",
-        code, code == 200 ? "OK" : "Error", ctype, len);
+        code, code == 200 ? "OK" : code == 401 ? "Unauthorized" :
+              code == 413 ? "Payload Too Large" : code == 415 ? "Unsupported Media Type" : "Error",
+        ctype, len);
     (void)send(client, hdr, n, 0);
     (void)send(client, body, len, 0);
 }
@@ -110,14 +154,13 @@ static void json_escape(char *dst, const char *src, size_t dst_size) {
     dst[j] = '\0';
 }
 
-// Block mutating ops during active print (F1, I6)
 static bool is_printer_busy(void) {
     PrinterStatus st;
     gcode_get_status_safe(&st);
     return (st.state == PRINTER_PRINTING || st.state == PRINTER_PAUSED);
 }
 
-static void handle_api(int client, Ch340Device *dev, char *method, char *path) {
+static void handle_api(int client, Ch340Device *dev, char *method, char *path, const char *req_buf) {
     PrinterStatus st;
     gcode_get_status_safe(&st);
     const char *resp = api_buf;
@@ -127,6 +170,13 @@ static void handle_api(int client, Ch340Device *dev, char *method, char *path) {
     if (is_get && is_mutating) {
         snprintf(api_buf, sizeof(api_buf), JSON_ERR, "Use POST method");
         send_response(client, 405, "application/json", api_buf);
+        return;
+    }
+
+    // 写操作需要认证
+    if (is_mutating && !check_auth(req_buf)) {
+        snprintf(api_buf, sizeof(api_buf), "{\"ok\":false,\"error\":\"Unauthorized\"}");
+        send_response(client, 401, "application/json", api_buf);
         return;
     }
 
@@ -201,10 +251,25 @@ static void handle_api(int client, Ch340Device *dev, char *method, char *path) {
     send_response(client, 200, "application/json", resp);
 }
 
-// Streaming upload: loop recv→fwrite (war-004), check I/O (I5), atomic rename (sys-001)
 static void handle_upload(int client, char *req_buf, int first_recvd,
                           int body_len, const char *boundary_str) {
     (void)boundary_str;
+
+    // 认证检查
+    if (!check_auth(req_buf)) {
+        snprintf(api_buf, sizeof(api_buf), "{\"ok\":false,\"error\":\"Unauthorized\"}");
+        send_response(client, 401, "application/json", api_buf);
+        return;
+    }
+
+    // Content-Type 校验
+    if (!find_header(req_buf, "Content-Type") ||
+        !strstr(find_header(req_buf, "Content-Type"), "multipart/form-data")) {
+        snprintf(api_buf, sizeof(api_buf), "{\"ok\":false,\"error\":\"Expected multipart/form-data\"}");
+        send_response(client, 415, "application/json", api_buf);
+        return;
+    }
+
     if (body_len > HTTP_UPLOAD_MAX_MB * 1024 * 1024) {
         snprintf(api_buf, sizeof(api_buf), JSON_ERR, "File too large");
         send_response(client, 413, "application/json", api_buf);
@@ -235,6 +300,14 @@ static void handle_upload(int client, char *req_buf, int first_recvd,
     if (safe != filename) memmove(filename, safe, strlen(safe) + 1);
     if (filename[0] == '\0') strcpy(filename, "upload.gcode");
 
+    // 扩展名白名单
+    if (!is_allowed_ext(filename)) {
+        snprintf(api_buf, sizeof(api_buf),
+                 "{\"ok\":false,\"error\":\"Only .gcode/.gco/.nc/.g files accepted\"}");
+        send_response(client, 415, "application/json", api_buf);
+        return;
+    }
+
     char filepath[320], tmppath[330];
     snprintf(filepath, sizeof(filepath), "sdmc:/switch/gcode/%s", filename);
     snprintf(tmppath, sizeof(tmppath), "sdmc:/switch/gcode/%s.tmp", filename);
@@ -248,7 +321,6 @@ static void handle_upload(int client, char *req_buf, int first_recvd,
         return;
     }
 
-    // Find data start: skip HTTP headers, then part headers
     const char *data_start = NULL;
     const char *http_body = strstr(req_buf, "\r\n\r\n");
     if (http_body) {
@@ -258,7 +330,6 @@ static void handle_upload(int client, char *req_buf, int first_recvd,
     }
     if (!data_start) data_start = req_buf;
 
-    // Write first chunk
     int first_data = first_recvd - (int)(data_start - req_buf);
     if (first_data > 0 && first_data <= first_recvd) {
         if (fwrite(data_start, 1, first_data, fp) != (size_t)first_data) {
@@ -269,7 +340,6 @@ static void handle_upload(int client, char *req_buf, int first_recvd,
         }
     }
 
-    // Stream remaining (war-004)
     int total = first_data > 0 ? first_data : 0;
     while (total < body_len) {
         int to_read = body_len - total;
@@ -316,6 +386,7 @@ static const char *extract_boundary(const char *req) {
 
 static void server_thread_func(void *arg) {
     (void)arg;
+    generate_token();
     update_ip();
     g_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (g_sock < 0) return;
@@ -357,10 +428,30 @@ static void server_thread_func(void *arg) {
         parse_method(req_buf, method, sizeof(method));
 
         if (strcmp(path, "/") == 0 || strncmp(path, "/index", 6) == 0) {
-            send_response(client, 200, "text/html;charset=utf-8", WEB_INDEX_HTML);
+            // 注入 auth token 到 HTML
+            char *index_html = NULL;
+            const char *marker = "__TOKEN__";
+            size_t base_len = strlen(WEB_INDEX_HTML);
+            size_t token_len = strlen(g_auth_token);
+            index_html = malloc(base_len + token_len + 1);
+            if (index_html) {
+                const char *pos = strstr(WEB_INDEX_HTML, marker);
+                if (pos) {
+                    size_t prefix_len = pos - WEB_INDEX_HTML;
+                    memcpy(index_html, WEB_INDEX_HTML, prefix_len);
+                    memcpy(index_html + prefix_len, g_auth_token, token_len);
+                    strcpy(index_html + prefix_len + token_len, pos + strlen(marker));
+                } else {
+                    strcpy(index_html, WEB_INDEX_HTML);
+                }
+                send_response(client, 200, "text/html;charset=utf-8", index_html);
+                free(index_html);
+            } else {
+                send_response(client, 200, "text/html;charset=utf-8", WEB_INDEX_HTML);
+            }
         }
         else if (strncmp(path, "/api/", 5) == 0) {
-            handle_api(client, g_printer, method, path);
+            handle_api(client, g_printer, method, path, req_buf);
         }
         else if (strcmp(path, "/upload") == 0) {
             const char *cl = find_header(req_buf, "Content-Length");
@@ -390,7 +481,7 @@ Result httpd_start(Ch340Device *printer_dev) {
     g_printer = printer_dev;
     g_running = true;
     Result rc = threadCreate(&g_server_thread, server_thread_func, NULL, NULL,
-                             0x20000, 0x2B, -1);
+                             HTTPD_THREAD_STACK_SIZE, HTTPD_THREAD_PRIORITY, THREAD_DEFAULT_CORE);
     if (R_FAILED(rc)) { g_running = false; return rc; }
     g_server_started = true;
     threadStart(&g_server_thread);

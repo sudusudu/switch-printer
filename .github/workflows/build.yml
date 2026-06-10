@@ -6,31 +6,27 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      image: devkitpro/devkita64:latest
+      image: devkitpro/devkita64:20250201
       options: --user root
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Diagnose input API
+      - name: Diagnose build environment
+        shell: bash
         run: |
+          set +e
           export DEVKITPRO=/opt/devkitpro
           INC="$DEVKITPRO/libnx/include/switch"
-          echo "=== Search for ScanInput/KeysDown/padUpdate ==="
-          grep -rn "ScanInput\|KeysDown\|padUpdate\|padConfigure\|padInitialize\|GetButtons" "$INC" --include="*.h" | grep -v ".git" | head -40
+          echo "=== Header files ==="
+          ls "$INC/"*.h 2>/dev/null | head -30 || echo "(not found)"
           echo ""
-          echo "=== hiddbg functions ==="
-          grep -rn "hiddbg" "$INC/services" --include="*.h" | grep "Result\|void\|u64" | head -20
-          echo ""
-          echo "=== All header files ==="
-          ls "$INC/"*.h | head -30
-          echo ""
-          echo "=== applet headers ==="
-          ls "$INC/applets/" 2>/dev/null | head -20
-          echo "=== kernel headers ==="
-          ls "$INC/kernel/" 2>/dev/null | head -20
+          echo "=== Toolchain ==="
+          aarch64-none-elf-gcc --version 2>/dev/null | head -1 || echo "(not found)"
+          set -e
 
       - name: Build
+        shell: bash
         run: |
           export DEVKITPRO=/opt/devkitpro
           export PATH="$DEVKITPRO/devkitA64/bin:$DEVKITPRO/tools/bin:$PATH"
