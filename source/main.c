@@ -1,4 +1,5 @@
 #include <switch.h>
+#include <switch/runtime/pad.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -27,7 +28,8 @@ static void draw_bar(const char *label, float actual, float target, float max) {
     printf("  %-6s ", label);
     int w = 20;
     float ratio = actual / max;
-    if (ratio < 0) ratio = 0; if (ratio > 1) ratio = 1;
+    if (ratio < 0) ratio = 0;
+    if (ratio > 1) ratio = 1;
     int filled = (int)(ratio * w);
 
     // 颜色：冷蓝(<40) 暖绿(40-60) 热黄(60-80) 烫红(>80)
@@ -131,6 +133,11 @@ int main(int argc, char **argv) {
     consoleInit(NULL);
     socketInitializeDefault();
 
+    // 初始化手柄输入（新版 libnx pad API）
+    PadState pad;
+    padConfigureInput(1, HidNpadStyleTag_NpadStandard);
+    padInitializeDefault(&pad);
+
     printf("\n" CLR_BOLD CLR_CYAN "  Switch 3D Printer" CLR_RST "\n");
     printf("  " CLR_DIM "正在初始化..." CLR_RST "\n\n");
     consoleUpdate(NULL);
@@ -177,11 +184,11 @@ int main(int argc, char **argv) {
     }
 
     while (appletMainLoop()) {
-        hidScanInput();
-        u64 down = hidKeysDown(CONTROLLER_P1_AUTO);
+        padUpdate(&pad);
+        u64 down = padGetButtonsDown(&pad);
 
         // + 键：连接
-        if ((down & KEY_PLUS) && !printer->connected) {
+        if ((down & HidNpadButton_Plus) && !printer->connected) {
             consoleClear();
             printf("\n  " CLR_YEL "重新扫描..." CLR_RST "\n");
             consoleUpdate(NULL);
@@ -195,13 +202,13 @@ int main(int argc, char **argv) {
         }
 
         // - 键：断开
-        if ((down & KEY_MINUS) && printer->connected) {
+        if ((down & HidNpadButton_Minus) && printer->connected) {
             httpd_stop();
             ch340_disconnect(printer);
         }
 
         // A 键：暂停/恢复
-        if (down & KEY_A) {
+        if (down & HidNpadButton_A) {
             PrinterStatus st;
             gcode_get_status_safe(&st);
             if (st.state == PRINTER_PRINTING) gcode_pause();
@@ -209,7 +216,7 @@ int main(int argc, char **argv) {
         }
 
         // B 键：取消打印
-        if (down & KEY_B) {
+        if (down & HidNpadButton_B) {
             PrinterStatus st;
             gcode_get_status_safe(&st);
             if (st.state == PRINTER_PRINTING || st.state == PRINTER_PAUSED)
@@ -217,7 +224,7 @@ int main(int argc, char **argv) {
         }
 
         // X 键：退出
-        if (down & KEY_X) break;
+        if (down & HidNpadButton_X) break;
 
         gcode_update(printer);
         draw_ui(printer);
