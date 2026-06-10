@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <math.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -219,7 +220,6 @@ static void handle_upload(int client, const char *req_body, int body_len,
     const char *data_start = NULL;
     const char *http_body = strstr(req_body, "\r\n\r\n");
     if (http_body) {
-        // Find part headers \r\n\r\n after boundary
         const char *after_boundary = http_body + 4;
         data_start = strstr(after_boundary, "\r\n\r\n");
         if (data_start) data_start += 4;
@@ -278,10 +278,14 @@ static void server_thread_func(void *arg) {
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(HTTP_PORT);
     if (bind(g_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        if (g_sock >= 0) close(g_sock); g_sock = -1; return;
+        if (g_sock >= 0) close(g_sock);
+        g_sock = -1;
+        return;
     }
     if (listen(g_sock, 5) < 0) {
-        if (g_sock >= 0) close(g_sock); g_sock = -1; return;
+        if (g_sock >= 0) close(g_sock);
+        g_sock = -1;
+        return;
     }
     struct timeval tv; tv.tv_sec = 1; tv.tv_usec = 0;
     setsockopt(g_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
