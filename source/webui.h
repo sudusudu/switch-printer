@@ -1,7 +1,7 @@
 #pragma once
 
-// Switch Printer — Mainsail-style Web Dashboard
-// Embedded single-file HTML/CSS/JS, dark industrial theme, responsive
+// Switch Printer — Mainsail-style Web Dashboard (textContent-safe, POST CSRF-protected)
+// Temperature thresholds must match config.h: 190/120/40, max 300/120
 static const char *WEB_INDEX_HTML =
 "<!DOCTYPE html><html lang=\"zh\"><head>"
 "<meta charset=\"utf-8\">"
@@ -133,22 +133,28 @@ static const char *WEB_INDEX_HTML =
 "<input type=\"file\" id=\"gcode-file\" accept=\".gcode,.gco,.nc\">"
 "<button onclick=\"uploadFile()\">Upload & Print</button></div>"
 "<div class=\"lg\" id=\"log\"><span class=\"ts\">--:--:--</span> Waiting for printer...</div>"
+// P0: textContent replaces innerHTML (SEC-004 XSS), POST for mutating APIs (SEC-003 CSRF)
 "<script>"
 "var prt=0,elt=0;"
-"function api(c){fetch('/api/'+c).then(function(r){return r.json()}).then(function(d){"
+"function api(c){var m=(c==='status')?'GET':'POST';"
+"fetch('/api/'+c,{method:m}).then(function(r){return r.json()}).then(function(d){"
 "log(d.msg||d.error||c)})}"
-"function move(a,d){fetch('/api/move?axis='+a+'&dist='+d)"
+"function move(a,d){fetch('/api/move?axis='+a+'&dist='+d,{method:'POST'})"
 ".then(function(r){return r.json()}).then(function(d){log(d.msg)})}"
 "function uploadFile(){var f=document.getElementById('gcode-file').files[0];"
 "if(!f)return;var fd=new FormData();fd.append('file',f);"
 "log('Upload: '+f.name+' ('+(f.size/1e6).toFixed(1)+' MB)');"
 "fetch('/upload',{method:'POST',body:fd}).then(function(r){return r.json()})"
 ".then(function(d){log(d.msg||d.error)})}"
+// textContent-safe logging (no innerHTML)
 "var lgEl=document.getElementById('log');"
 "function log(m){var t=new Date().toLocaleTimeString();"
-"lgEl.innerHTML+='<span class=\"ts\">'+t+'</span> '+m+'\\n';"
-"lgEl.scrollTop=lgEl.scrollHeight;"
+"var d=document.createElement('div');"
+"var ts=document.createElement('span');ts.className='ts';ts.textContent=t;"
+"d.appendChild(ts);d.appendChild(document.createTextNode(' '+m));"
+"lgEl.appendChild(d);lgEl.scrollTop=lgEl.scrollHeight;"
 "if(lgEl.children.length>200)lgEl.firstChild.remove()}"
+// Temp ring update (thresholds: 190/120/40, max 300/120 — match config.h)
 "function updateRing(el,temp,max,elV,elT){var ratio=Math.min(temp/max,1);"
 "var circ=301;var dash=ratio*circ;"
 "el.setAttribute('stroke-dasharray',dash+' '+(circ-dash));"
