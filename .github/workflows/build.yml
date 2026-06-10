@@ -12,18 +12,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Diagnose HID API
+      - name: Diagnose input API
         run: |
           export DEVKITPRO=/opt/devkitpro
-          HIDH="$DEVKITPRO/libnx/include/switch/services/hid.h"
-          echo "=== hidScanInput / hidKeysDown ==="
-          grep -n "hidScanInput\|hidKeysDown\|CONTROLLER_P1\|KEY_PLUS\|KEY_A\|HidNpadButton" "$HIDH" | head -30
-          echo "=== pad functions ==="
-          grep -n "padUpdate\|padGetButtons\|padConfigure\|padInitialize" "$HIDH" | head -30
-          echo "=== switch.h hid include ==="
-          grep -rn "hid" "$DEVKITPRO/libnx/include/switch/switch.h" 2>/dev/null | head -10
-          echo "=== libnx version ==="
-          cat "$DEVKITPRO/libnx/include/switch/version.h" 2>/dev/null | head -15
+          INC="$DEVKITPRO/libnx/include/switch"
+          echo "=== Search for ScanInput/KeysDown/padUpdate ==="
+          grep -rn "ScanInput\|KeysDown\|padUpdate\|padConfigure\|padInitialize\|GetButtons" "$INC" --include="*.h" | grep -v ".git" | head -40
+          echo ""
+          echo "=== hiddbg functions ==="
+          grep -rn "hiddbg" "$INC/services" --include="*.h" | grep "Result\|void\|u64" | head -20
+          echo ""
+          echo "=== All header files ==="
+          ls "$INC/"*.h | head -30
+          echo ""
+          echo "=== applet headers ==="
+          ls "$INC/applets/" 2>/dev/null | head -20
+          echo "=== kernel headers ==="
+          ls "$INC/kernel/" 2>/dev/null | head -20
 
       - name: Build
         run: |
