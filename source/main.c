@@ -3,12 +3,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 #include "usb_ch340.h"
 #include "gcode.h"
 #include "httpd.h"
 #include "config.h"
 
-// ANSI colors
 #define CLR_RST    "\x1b[0m"
 #define CLR_RED    "\x1b[31m"
 #define CLR_GRN    "\x1b[32m"
@@ -18,23 +18,21 @@
 #define CLR_BOLD   "\x1b[1m"
 #define CLR_DIM    "\x1b[2m"
 
-// ============================================================
-// Unicode 1/8 block elements: 20-char bar = 160 discrete levels
-// ============================================================
 static const char *blk[9] = {
     " ",
-    "\xe2\x96\x8f",  // U+258F
-    "\xe2\x96\x8e",  // U+258E
-    "\xe2\x96\x8d",  // U+258D
-    "\xe2\x96\x8c",  // U+258C
-    "\xe2\x96\x8b",  // U+258B
-    "\xe2\x96\x8a",  // U+258A
-    "\xe2\x96\x89",  // U+2589
-    "\xe2\x96\x88"   // U+2588
+    "\xe2\x96\x8f",
+    "\xe2\x96\x8e",
+    "\xe2\x96\x8d",
+    "\xe2\x96\x8c",
+    "\xe2\x96\x8b",
+    "\xe2\x96\x8a",
+    "\xe2\x96\x89",
+    "\xe2\x96\x88"
 };
 
 static void blkbar(int w, float v, float max, const char *hi, const char *lo) {
     float r = (max > 0) ? v / max : 0;
+    if (!isfinite(r)) r = 0;
     if (r < 0) r = 0;
     if (r > 1) r = 1;
     int full = (int)(r * w);
@@ -49,9 +47,9 @@ static void blkbar(int w, float v, float max, const char *hi, const char *lo) {
 }
 
 static const char *tclr(float t) {
-    if (t >= 190) return CLR_RED;
-    if (t >= 120) return CLR_YEL;
-    if (t >= 40)  return CLR_GRN;
+    if (t >= TEMP_THRESHOLD_HOT)  return CLR_RED;
+    if (t >= TEMP_THRESHOLD_WARM) return CLR_YEL;
+    if (t >= TEMP_THRESHOLD_COLD) return CLR_GRN;
     return CLR_CYAN;
 }
 
@@ -78,8 +76,15 @@ static void draw_ui(Ch340Device *dev) {
         "\xe6\x9a\x82\xe5\x81\x9c",
         "\xe9\x94\x99\xe8\xaf\xaf"
     };
-    const char *sc[] = {CLR_DIM,CLR_GRN,CLR_YEL CLR_BOLD,CLR_CYAN,CLR_RED CLR_BOLD};
-    int s = (st.state >= 0 && st.state <= 4) ? st.state : 0;
+    // P0: explicit concatenation instead of fragile missing-comma (MOW-007)
+    const char *sc[] = {
+        CLR_DIM,
+        CLR_GRN,
+        "\x1b[33m\x1b[1m",
+        CLR_CYAN,
+        "\x1b[31m\x1b[1m"
+    };
+    int s = (st.state >= 0 && st.state < PRINTER_STATE_COUNT) ? st.state : 0;
 
     const char *wifi_ip = httpd_get_ip();
     bool wf = (wifi_ip[0] != '0' && wifi_ip[0] != '\0');
@@ -105,7 +110,7 @@ static void draw_ui(Ch340Device *dev) {
     hr();
 
     printf("\xe2\x94\x82  " CLR_BOLD "Nozzle" CLR_RST " ");
-    blkbar(30, st.temp.nozzle_actual, 300,
+    blkbar(30, st.temp.nozzle_actual, PRINTER_NOZZLE_MAX_TEMP,
            tclr(st.temp.nozzle_actual), CLR_DIM);
     printf(" " CLR_BOLD "%5.0f" CLR_RST, st.temp.nozzle_actual);
     if (st.temp.nozzle_target > 0)
@@ -120,8 +125,9 @@ static void draw_ui(Ch340Device *dev) {
     end78(78);
 
     printf("\xe2\x94\x82  " CLR_BOLD "Bed   " CLR_RST " ");
-    blkbar(30, st.temp.bed_actual, 120,
-           tclr(st.temp.bed_actual * 2.5f), CLR_DIM);
+    blkbar(30, st.temp.bed_actual, PRINTER_BED_MAX_TEMP,
+           tclr(st.temp.bed_actual * (PRINTER_NOZZLE_MAX_TEMP / (float)PRINTER_BED_MAX_TEMP)),
+           CLR_DIM);
     printf(" " CLR_BOLD "%5.0f" CLR_RST, st.temp.bed_actual);
     if (st.temp.bed_target > 0)
         printf(CLR_DIM "/%-5.0f" CLR_RST, st.temp.bed_target);
@@ -141,11 +147,9 @@ static void draw_ui(Ch340Device *dev) {
                (s == 3) ? CLR_YEL : CLR_CYAN, CLR_DIM);
         printf(" " CLR_BOLD "%3d%%" CLR_RST, st.progress_percent);
         end78(78);
-
         printf("\xe2\x94\x82  \xf0\x9f\x93\x84 %s",
                st.current_file[0] ? st.current_file : "(no file)");
         end78(4 + (int)strlen(st.current_file[0] ? st.current_file : "(no file)"));
-
         printf("\xe2\x94\x82  %d / %d lines", st.lines_sent, st.lines_total);
         end78(14);
     } else {
@@ -183,6 +187,7 @@ static void draw_ui(Ch340Device *dev) {
 }
 
 int main(int argc, char **argv) {
+    (void)argc; (void)argv;
     Result rc;
 
     consoleInit(NULL);
@@ -220,6 +225,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     memset(printer, 0, sizeof(Ch340Device));
+    mutexInit(&printer->mutex);
 
     printf("\n  " CLR_YEL "Scanning for printer..." CLR_RST "\n");
     consoleUpdate(NULL);
@@ -254,7 +260,9 @@ int main(int argc, char **argv) {
             }
         }
 
+        // P0: cancel print before disconnect (war-MOW003, SEC-MOW003)
         if ((down & HidNpadButton_Minus) && printer->connected) {
+            gcode_cancel(printer);
             httpd_stop();
             ch340_disconnect(printer);
         }
