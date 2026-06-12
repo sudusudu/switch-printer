@@ -6,7 +6,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      image: devkitpro/devkita64:20250201
+      image: devkitpro/devkita64:latest
       options: --user root
 
     steps:
