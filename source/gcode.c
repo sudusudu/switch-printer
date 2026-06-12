@@ -1,6 +1,8 @@
 #include <stdatomic.h>
 #include <math.h>
 #include "gcode.h"
+#include "logger.h"
+#include "config.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +11,7 @@ static PrinterStatus g_status;
 static atomic_bool g_paused = false;
 static atomic_bool g_cancel = false;
 static atomic_bool g_thread_running = false;
+static atomic_bool g_thread_created = false;  // 跟踪 threadCreate 是否成功,防 threadWaitForExit 崩溃
 static Mutex g_status_mutex;
 
 static Thread g_print_thread;
@@ -89,6 +92,41 @@ static Result wait_ok(Ch340Device *dev, u64 timeout_ms) {
     return MAKERESULT(Module_Libnx, 5);
 }
 
+// ============================================================
+// USB 断连恢复: 等待重连，超时则紧急停机 + 保存断点
+// ============================================================
+static bool try_usb_reconnect(Ch340Device *dev, int timeout_sec) {
+    LOG_W("USB disconnected — attempting reconnect (%ds)...", timeout_sec);
+    u64 deadline = armGetSystemTick() +
+        armNsToTicks((u64)timeout_sec * 1000000000ULL);
+
+    while (armGetSystemTick() < deadline) {
+        if (atomic_load(&g_cancel)) return false;
+        svcSleepThread(USB_RECONNECT_POLL_MS * 1000000ULL);
+
+        // 尝试重新连接
+        ch340_disconnect(dev);
+        Result rc = ch340_connect(dev);
+        if (R_SUCCEEDED(rc) && dev->connected) {
+            LOG_I("USB reconnected!");
+            return true;
+        }
+    }
+    LOG_E("USB reconnect timeout — emergency stop");
+    return false;
+}
+
+// ============================================================
+// 断点保存：USB 断开时记录当前行号，恢复打印时从断点继续
+// ============================================================
+static void save_resume_point(int line_num, const char *file_path) {
+    FILE *fp = fopen(RESUME_FILE_PATH, "w");
+    if (!fp) return;
+    fprintf(fp, "%d\n%s\n", line_num, file_path);
+    fclose(fp);
+    LOG_P("Resume point saved: line %d of %s", line_num, file_path);
+}
+
 static void print_thread_func(void *arg) {
     (void)arg;
     FILE *fp = fopen(g_file_path, "r");
@@ -139,10 +177,32 @@ static void print_thread_func(void *arg) {
         line_buf[len] = '\n'; line_buf[len+1] = '\0';
 
         Result rc = ch340_send(g_dev, line_buf, len + 1);
-        if (R_FAILED(rc)) { error = true; break; }
+        if (R_FAILED(rc)) {
+            // USB 断连恢复流程
+            save_resume_point(line_num, g_file_path);
+            if (!try_usb_reconnect(g_dev, USB_RECONNECT_TIMEOUT_SEC)) {
+                error = true; break;
+            }
+            // 重连成功——重发当前行
+            rc = ch340_send(g_dev, line_buf, len + 1);
+            if (R_FAILED(rc)) { error = true; break; }
+        }
 
         rc = wait_ok(g_dev, GCODE_OK_TIMEOUT);
-        if (R_FAILED(rc)) { error = true; break; }
+        if (R_FAILED(rc)) {
+            // wait_ok 失败也可能是 USB 断开
+            if (!g_dev->connected) {
+                save_resume_point(line_num, g_file_path);
+                if (!try_usb_reconnect(g_dev, USB_RECONNECT_TIMEOUT_SEC)) {
+                    error = true; break;
+                }
+                // 重连后重试（行已发送，只需等 ok）
+                rc = wait_ok(g_dev, GCODE_OK_TIMEOUT);
+                if (R_FAILED(rc)) { error = true; break; }
+            } else {
+                error = true; break;
+            }
+        }
 
         line_num++;
         mutexLock(&g_status_mutex);
@@ -172,6 +232,8 @@ static void print_thread_func(void *arg) {
         g_status.state = PRINTER_IDLE;
         g_status.progress_percent = 100;
         g_status.lines_sent = total_lines;
+        // 打印成功完成 -> 清理断点文件
+        remove(RESUME_FILE_PATH);
     }
     mutexUnlock(&g_status_mutex);
     atomic_store(&g_thread_running, false);
@@ -194,16 +256,30 @@ Result gcode_start_print(Ch340Device *dev, const char *file_path) {
     g_status.current_file[sizeof(g_status.current_file) - 1] = '\0';
     mutexUnlock(&g_status_mutex);
 
+    LOG_P("Print started: %s (%d lines estimated)", file_path,
+          (int)(0));
+
     Result rc = threadCreate(&g_print_thread, print_thread_func, NULL, NULL,
-                             PRINT_THREAD_STACK_SIZE, PRINT_THREAD_PRIORITY, THREAD_DEFAULT_CORE);
+                             PRINT_THREAD_STACK_SIZE, PRINT_THREAD_PRIORITY, CORE_PRINT);
     if (R_FAILED(rc)) {
         mutexLock(&g_status_mutex);
         g_status.state = PRINTER_IDLE;
         mutexUnlock(&g_status_mutex);
         return rc;
     }
+    // 线程创建成功即标记"需清理"，避免 threadStart 前的竞态窗口
+    atomic_store(&g_thread_created, true);
     atomic_store(&g_thread_running, true);
-    threadStart(&g_print_thread);
+    rc = threadStart(&g_print_thread);
+    if (R_FAILED(rc)) {
+        threadClose(&g_print_thread);
+        atomic_store(&g_thread_created, false);
+        atomic_store(&g_thread_running, false);
+        mutexLock(&g_status_mutex);
+        g_status.state = PRINTER_IDLE;
+        mutexUnlock(&g_status_mutex);
+        return rc;
+    }
     return 0;
 }
 
@@ -227,8 +303,11 @@ Result gcode_cancel(Ch340Device *dev) {
     (void)dev;
     atomic_store(&g_cancel, true);
     atomic_store(&g_paused, false);
-    threadWaitForExit(&g_print_thread);
-    threadClose(&g_print_thread);
+    if (atomic_load(&g_thread_created)) {
+        threadWaitForExit(&g_print_thread);
+        threadClose(&g_print_thread);
+        atomic_store(&g_thread_created, false);
+    }
     atomic_store(&g_thread_running, false);
     return 0;
 }

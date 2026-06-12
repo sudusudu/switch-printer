@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <limits.h>
 #include <math.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -24,12 +25,14 @@ static int g_sock = -1;
 static char g_auth_token[17] = "";
 
 static void generate_token(void) {
-    u64 rnd;
-    randomGet64(&rnd);
+    u64 rnd = randomGet64();
     snprintf(g_auth_token, sizeof(g_auth_token), "%016llX", (unsigned long long)rnd);
 }
 
 const char *httpd_get_auth_token(void) { return g_auth_token; }
+
+// 前向声明（GCC 16 禁止隐式函数声明）
+static const char *find_header(const char *req, const char *name);
 
 // ============================================================
 // 认证检查：仅通过 X-Auth-Token HTTP 头（不在 URL 中传递，
@@ -39,7 +42,12 @@ static bool check_auth(const char *req_buf) {
     if (g_auth_token[0] == '\0') return true;
     // 使用 find_header() 做大小写不敏感匹配（HTTP 头名称不区分大小写）
     const char *hdr = find_header(req_buf, "x-auth-token");
-    if (hdr && strncmp(hdr, g_auth_token, 16) == 0) return true;
+    // strncmp 只比 16 字节——需确认第 17 字节是终止符/空白，防尾部追加绕过
+    if (hdr && strncmp(hdr, g_auth_token, 16) == 0) {
+        char c = hdr[16];
+        if (c == '\0' || c == '\r' || c == '\n' || c == ' ')
+            return true;
+    }
     return false;
 }
 
@@ -122,7 +130,7 @@ static const char *find_header(const char *req, const char *name) {
                 match = false; break;
             }
         }
-        if (match && p[name_len] == ':') {
+        if (match && (p + name_len < hd_end) && p[name_len] == ':') {
             const char *val = p + name_len + 1;
             while (*val == ' ' || *val == '\t') val++;
             return val;
@@ -368,9 +376,12 @@ static void handle_upload(int client, char *req_buf, int first_recvd,
         send_response(client, 409, "application/json", api_buf);
         return;
     }
+    // 文件名中含 " 或 \ 会破坏 JSON——转义后使用
+    char escaped_fn[300];
+    json_escape(escaped_fn, filename, sizeof(escaped_fn));
     snprintf(api_buf, sizeof(api_buf),
         "{\"ok\":true,\"msg\":\"Uploaded: %s\",\"lines\":%d}",
-        filename, total / GCODE_EST_BYTES_PER_LINE);
+        escaped_fn, total / GCODE_EST_BYTES_PER_LINE);
     send_response(client, 200, "application/json", api_buf);
 }
 
@@ -456,7 +467,8 @@ static void server_thread_func(void *arg) {
             if (cl) {
                 char *endp = NULL;
                 long val = strtol(cl, &endp, 10);
-                if (val > 0 && endp != cl) body_len = (int)val;
+                // 防止整数溢出：long → int 截断会导致负值绕过大小检查
+                if (val > 0 && val <= INT_MAX && endp != cl) body_len = (int)val;
             }
             const char *bd_str = extract_boundary(req_buf);
             handle_upload(client, req_buf, recvd, body_len, bd_str);
@@ -478,7 +490,7 @@ Result httpd_start(Ch340Device *printer_dev) {
     g_printer = printer_dev;
     g_running = true;
     Result rc = threadCreate(&g_server_thread, server_thread_func, NULL, NULL,
-                             HTTPD_THREAD_STACK_SIZE, HTTPD_THREAD_PRIORITY, THREAD_DEFAULT_CORE);
+                             HTTPD_THREAD_STACK_SIZE, HTTPD_THREAD_PRIORITY, CORE_HTTP);
     if (R_FAILED(rc)) { g_running = false; return rc; }
     g_server_started = true;
     threadStart(&g_server_thread);

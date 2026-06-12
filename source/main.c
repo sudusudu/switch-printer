@@ -8,6 +8,9 @@
 #include "gcode.h"
 #include "httpd.h"
 #include "config.h"
+#include "power.h"
+#include "logger.h"
+#include "crash.h"
 
 #define CLR_RST    "\x1b[0m"
 #define CLR_RED    "\x1b[31m"
@@ -34,7 +37,8 @@ static const char *unicode_block_chars[9] = {
 };
 
 // 预组装渲染缓冲区（避免每帧数百次 printf 调用）
-static char line_buf[CONSOLE_WIDTH + 8];
+// UTF-8 3字节/字符: 横线 242B, 进度条 ~220B → 512B 安全
+static char line_buf[512];
 
 static void draw_progress_bar(int width, float value, float max_val,
                                const char *hi_color, const char *lo_color) {
@@ -82,21 +86,22 @@ static void draw_horizontal_rule(void) {
 }
 
 static void draw_ui(Ch340Device *dev) {
+    // 防烧屏微移偏移（GPU Phase 2 会做亚像素级，console 版本做不了）
     consoleClear();
     PrinterStatus st;
     gcode_get_status_safe(&st);
 
     const char *state_names[] = {
-        "\xe7\xa6\xbb\xe7\xba\xbf",   // 离线
-        "\xe7\xa9\xba\xe9\x97\xb2",   // 空闲
-        "\xe6\x89\x93\xe5\x8d\xb0\xe4\xb8\xad", // 打印中
-        "\xe6\x9a\x82\xe5\x81\x9c",   // 暂停
-        "\xe9\x94\x99\xe8\xaf\xaf"    // 错误
+        "\xe7\xa6\xbb\xe7\xba\xbf",        // 离线
+        "\xe7\xa9\xba\xe9\x97\xb2",        // 空闲
+        "\xe6\x89\x93\xe5\x8d\xb0\xe4\xb8\xad",  // 打印中
+        "\xe6\x9a\x82\xe5\x81\x9c",        // 暂停
+        "\xe9\x94\x99\xe8\xaf\xaf"         // 错误
     };
     const char *state_colors[] = {
         CLR_DIM,
         CLR_GRN,
-        "\x1b[33m\x1b[1m",           // 显式预合并,避免 C 相邻字符串拼接歧义
+        "\x1b[33m\x1b[1m",
         CLR_CYAN,
         "\x1b[31m\x1b[1m"
     };
@@ -111,7 +116,7 @@ static void draw_ui(Ch340Device *dev) {
     printf(CLR_BOLD CLR_CYAN "\xe2\x94\x8c");
     for (int i = 0; i < CONSOLE_WIDTH; i++) printf("\xe2\x94\x80");
     printf("\xe2\x94\x90\n");
-    printf("\xe2\x94\x82  \xf0\x9f\x8e\xae Switch 3D Printer v1.1");
+    printf("\xe2\x94\x82  \xf0\x9f\x8e\xae Switch 3D Printer v2.0");
     pad_line_to_end(30);
 
     draw_horizontal_rule();
@@ -222,15 +227,38 @@ int main(int argc, char **argv) {
     (void)argc; (void)argv;
     Result rc;
 
+    // ============================================================
+    // Phase 1: 基础设施初始化
+    // ============================================================
     consoleInit(NULL);
     socketInitializeDefault();
+
+    // 日志系统 (先于崩溃处理器, 崩溃时需要 flush 日志)
+    rc = logger_init();
+    if (R_FAILED(rc)) {
+        printf("\n  " CLR_YEL "SD log unavailable" CLR_RST "\n");
+    }
+
+    // 崩溃处理器
+    rc = crash_init();
+    if (R_FAILED(rc)) {
+        printf("\n  " CLR_YEL "Crash handler unavailable" CLR_RST "\n");
+    }
+
+    // 电源管理 + Applet 生命周期
+    rc = power_init();
+    if (R_FAILED(rc)) {
+        LOG_W("Power management init failed: 0x%x", rc);
+    }
+
+    LOG_I("Switch Printer v2.0 starting");
 
     PadState pad;
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&pad);
 
-    printf("\n" CLR_BOLD CLR_CYAN "  Switch 3D Printer" CLR_RST "\n");
-    printf("  " CLR_DIM "Initializing..." CLR_RST "\n\n");
+    printf("\n" CLR_BOLD CLR_CYAN "  Switch 3D Printer v2.0" CLR_RST "\n");
+    printf("  " CLR_DIM "Atmosphere CFW Deep Integration" CLR_RST "\n\n");
     consoleUpdate(NULL);
 
     gcode_init();
@@ -238,22 +266,30 @@ int main(int argc, char **argv) {
 
     rc = ch340_init();
     if (R_FAILED(rc)) {
+        LOG_E("USB init failed: 0x%x", rc);
         printf("\n  " CLR_RED "USB init failed: 0x%x" CLR_RST "\n", rc);
         printf("  " CLR_DIM "Check OTG cable connection" CLR_RST "\n\n");
         printf("  Press any key to exit...\n");
         consoleUpdate(NULL);
         while (appletMainLoop()) svcSleepThread(100000000ULL);
         consoleExit(NULL);
+        logger_exit();
+        crash_exit();
+        socketExit();
         return 0;
     }
 
     size_t dev_sz = (sizeof(Ch340Device) + 0xFFF) & ~0xFFF;
     Ch340Device *printer = aligned_alloc(0x1000, dev_sz);
     if (!printer) {
+        LOG_E("Memory allocation failed");
         printf("\n  " CLR_RED "Memory allocation failed" CLR_RST "\n\n");
         consoleUpdate(NULL);
         while (appletMainLoop()) svcSleepThread(100000000ULL);
         consoleExit(NULL);
+        logger_exit();
+        crash_exit();
+        socketExit();
         return 1;
     }
     memset(printer, 0, sizeof(Ch340Device));
@@ -267,6 +303,7 @@ int main(int argc, char **argv) {
         rc = ch340_connect(printer);
         if (R_SUCCEEDED(rc)) {
             printf("  " CLR_GRN "Printer connected!" CLR_RST "\n");
+            LOG_I("Printer connected via USB");
             httpd_start(printer);
             break;
         }
@@ -275,9 +312,33 @@ int main(int argc, char **argv) {
         retry++;
     }
 
+    // ============================================================
+    // Phase 2: 主循环 (集成电源管理 + Applet 生命周期)
+    // ============================================================
     while (appletMainLoop()) {
+        // --- 电源管理 ---
+        power_update(UI_REFRESH_NS);
+
+        // --- Applet 焦点检测 (HOME键/切桌面) ---
+        FocusEvent fe = power_check_focus();
+        if (fe == FOCUS_LOST) {
+            // 失去焦点 → 硬暂停打印
+            PrinterStatus st;
+            gcode_get_status_safe(&st);
+            if (st.state == PRINTER_PRINTING) {
+                gcode_pause();
+                LOG_P("Print paused: applet focus lost (HOME pressed)");
+            }
+        } else if (fe == FOCUS_RETURNED) {
+            LOG_I("Applet focus returned");
+        }
+
+        // --- 手柄输入 ---
         padUpdate(&pad);
         u64 down = padGetButtonsDown(&pad);
+
+        // 任何按键 = 用户交互 → 恢复亮度
+        if (down) power_on_interaction();
 
         if ((down & HidNpadButton_Plus) && !printer->connected) {
             consoleClear();
@@ -286,30 +347,43 @@ int main(int argc, char **argv) {
             rc = ch340_connect(printer);
             if (R_SUCCEEDED(rc)) {
                 printf("  " CLR_GRN "Connected!" CLR_RST "\n");
+                LOG_I("Printer connected (manual re-scan)");
                 httpd_start(printer);
             } else {
                 printf("  " CLR_DIM "Device not found" CLR_RST "\n");
+                LOG_W("Printer re-scan failed");
             }
         }
 
         if ((down & HidNpadButton_Minus) && printer->connected) {
+            LOG_I("Manual disconnect");
             gcode_cancel(printer);
             httpd_stop();
             ch340_disconnect(printer);
+            power_print_end();
         }
 
         if (down & HidNpadButton_A) {
             PrinterStatus st;
             gcode_get_status_safe(&st);
-            if (st.state == PRINTER_PRINTING) gcode_pause();
-            else if (st.state == PRINTER_PAUSED) gcode_resume();
+            if (st.state == PRINTER_PRINTING) {
+                gcode_pause();
+                LOG_P("Print paused (A button)");
+            }
+            else if (st.state == PRINTER_PAUSED) {
+                gcode_resume();
+                LOG_P("Print resumed (A button)");
+            }
         }
 
         if (down & HidNpadButton_B) {
             PrinterStatus st;
             gcode_get_status_safe(&st);
-            if (st.state == PRINTER_PRINTING || st.state == PRINTER_PAUSED)
+            if (st.state == PRINTER_PRINTING || st.state == PRINTER_PAUSED) {
+                LOG_P("Print cancelled (B button)");
                 gcode_cancel(printer);
+                power_print_end();
+            }
         }
 
         if (down & HidNpadButton_X) break;
@@ -320,9 +394,20 @@ int main(int argc, char **argv) {
         svcSleepThread(UI_REFRESH_NS);
     }
 
+    // ============================================================
+    // Phase 3: 干净退出
+    // ============================================================
+    LOG_I("Shutting down...");
     gcode_cancel(printer);
-    if (printer->connected) { httpd_stop(); ch340_disconnect(printer); }
+    if (printer->connected) {
+        httpd_stop();
+        ch340_disconnect(printer);
+    }
     free(printer);
+
+    power_exit();
+    crash_exit();
+    logger_exit();
     socketExit();
     consoleExit(NULL);
     return 0;

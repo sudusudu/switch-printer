@@ -20,11 +20,11 @@ ARCH := -march=armv8-a -mtune=cortex-a57 -fPIE
 CFLAGS  := -g -Wall -Wextra -Wno-unused-parameter \
            -ffunction-sections -fdata-sections \
            -MMD -MP \
-           -O2 $(ARCH) -I$(SRCDIR) -I$(DEVKITPRO)/libnx/include -D__SWITCH__
+           -O2 $(ARCH) -I$(SRCDIR) -I$(DEVKITPRO)/libnx/include -I$(DEVKITPRO)/portlibs/switch/include -D__SWITCH__
 LDFLAGS := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) \
            -L$(DEVKITPRO)/libnx/lib -L$(DEVKITPRO)/portlibs/switch/lib \
            -Wl,--gc-sections
-LIBS    := -lnx -lm
+LIBS    := -lnx -lm 
 
 SRCS := $(shell find $(SRCDIR) -name '*.c' 2>/dev/null || echo $(wildcard $(SRCDIR)/*.c))
 OBJS := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(SRCS))

@@ -9,7 +9,10 @@ static bool  g_usb_ready = false;
 Result ch340_init(void) {
     // 线程安全的懒初始化（外层 Mutex 保护 once 标志）
     static Mutex once_mutex;
+    static bool once_inited = false;
     static bool once_done = false;
+    // BSS 零值 Mutex 不可直接使用——先显式初始化
+    if (!once_inited) { mutexInit(&once_mutex); once_inited = true; }
     mutexLock(&once_mutex);
     if (!once_done) { mutexInit(&g_init_mutex); once_done = true; }
     mutexUnlock(&once_mutex);

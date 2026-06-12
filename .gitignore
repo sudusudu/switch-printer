@@ -1,0 +1,9 @@
+build/
+*.o
+*.d
+*.elf
+*.nro
+*.nacp
+crash_dump.txt
+*.log
+.claude/
