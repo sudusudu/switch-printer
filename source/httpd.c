@@ -196,6 +196,12 @@ static void handle_api(int client, Ch340Device *dev, char *method, char *path, c
         return;
     }
 
+    if (is_mutating && (!dev || !dev->connected)) {
+        snprintf(api_buf, sizeof(api_buf), JSON_ERR, "Printer offline");
+        send_response(client, 409, "application/json", api_buf);
+        return;
+    }
+
     if (strcmp(path, "/api/status") == 0) {
         const char *state_names[] = {"offline","idle","printing","paused","error"};
         const char *sn = (st.state < PRINTER_STATE_COUNT) ? state_names[st.state] : "unknown";
@@ -288,6 +294,12 @@ static void handle_upload(int client, char *req_buf, int first_recvd,
     if (!check_auth(req_buf)) {
         snprintf(api_buf, sizeof(api_buf), "{\"ok\":false,\"error\":\"Unauthorized\"}");
         send_response(client, 401, "application/json", api_buf);
+        return;
+    }
+
+    if (!g_printer || !g_printer->connected) {
+        snprintf(api_buf, sizeof(api_buf), JSON_ERR, "Printer offline");
+        send_response(client, 409, "application/json", api_buf);
         return;
     }
 
@@ -451,8 +463,11 @@ static void server_thread_func(void *arg) {
     setsockopt(g_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     static char req_buf[HTTP_REQ_BUF_SIZE];
+    int ip_refresh_ticks = 0;
 
     while (g_running) {
+        if ((ip_refresh_ticks++ % 5) == 0)
+            update_ip();
         struct sockaddr_in ca;
         socklen_t cl = sizeof(ca);
         int client = accept(g_sock, (struct sockaddr*)&ca, &cl);
@@ -518,8 +533,8 @@ static void server_thread_func(void *arg) {
 Result httpd_init(void) { return 0; }
 
 Result httpd_start(Ch340Device *printer_dev) {
-    if (g_running) return 0;
     g_printer = printer_dev;
+    if (g_running) return 0;
     g_running = true;
     Result rc = threadCreate(&g_server_thread, server_thread_func, NULL, NULL,
                              HTTPD_THREAD_STACK_SIZE, HTTPD_THREAD_PRIORITY, CORE_HTTP);

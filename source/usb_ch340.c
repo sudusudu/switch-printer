@@ -77,16 +77,19 @@ Result ch340_connect(Ch340Device *dev) {
     UsbHsInterface interfaces[8];
     memset(interfaces, 0, sizeof(interfaces));
     s32 found_count = 0;
-    rc = usbHsQueryAvailableInterfaces(NULL, interfaces, sizeof(interfaces), &found_count);
+    rc = usbHsQueryAvailableInterfaces(NULL, interfaces,
+                                        (s32)(sizeof(interfaces) / sizeof(interfaces[0])),
+                                        &found_count);
     if (R_FAILED(rc)) return rc;
 
     bool found = false;
+    s32 found_index = -1;
     s32 limit = (found_count < 8) ? found_count : 8;
     for (s32 i = 0; i < limit; i++) {
         if (interfaces[i].device_desc.idVendor != CH340_VID ||
             interfaces[i].device_desc.idProduct != CH340_PID) continue;
         rc = usbHsAcquireUsbIf(&dev->if_session, &interfaces[i]);
-        if (R_SUCCEEDED(rc)) { found = true; break; }
+        if (R_SUCCEEDED(rc)) { found = true; found_index = i; break; }
     }
     if (!found) return MAKERESULT(Module_Libnx, 4);
 
@@ -99,14 +102,13 @@ Result ch340_connect(Ch340Device *dev) {
     int ep_max = (int)(sizeof(interfaces[0].inf.output_endpoint_descs) /
                        sizeof(interfaces[0].inf.output_endpoint_descs[0]));
 
-    for (s32 idx = 0; idx < limit; idx++) {
+    if (found_index >= 0) {
         for (int j = 0; j < ep_max; j++) {
-            if (interfaces[idx].inf.output_endpoint_descs[j].bEndpointAddress != 0 && !out_desc)
-                out_desc = &interfaces[idx].inf.output_endpoint_descs[j];
-            if (interfaces[idx].inf.input_endpoint_descs[j].bEndpointAddress != 0 && !in_desc)
-                in_desc = &interfaces[idx].inf.input_endpoint_descs[j];
+            if (interfaces[found_index].inf.output_endpoint_descs[j].bEndpointAddress != 0 && !out_desc)
+                out_desc = &interfaces[found_index].inf.output_endpoint_descs[j];
+            if (interfaces[found_index].inf.input_endpoint_descs[j].bEndpointAddress != 0 && !in_desc)
+                in_desc = &interfaces[found_index].inf.input_endpoint_descs[j];
         }
-        if (out_desc && in_desc) break;
     }
 
     if (out_desc) {

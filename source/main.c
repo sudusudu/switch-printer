@@ -263,6 +263,12 @@ int main(int argc, char **argv) {
 
     gcode_init();
     httpd_init();
+    rc = httpd_start(NULL);
+    if (R_FAILED(rc)) {
+        LOG_E("HTTP server start failed: 0x%x", rc);
+        printf("\n  " CLR_YEL "HTTP server failed: 0x%x" CLR_RST "\n", rc);
+        consoleUpdate(NULL);
+    }
 
     rc = ch340_init();
     if (R_FAILED(rc)) {
@@ -399,8 +405,8 @@ int main(int argc, char **argv) {
     // ============================================================
     LOG_I("Shutting down...");
     gcode_cancel(printer);
+    httpd_stop();
     if (printer->connected) {
-        httpd_stop();
         ch340_disconnect(printer);
     }
     free(printer);
