@@ -273,19 +273,15 @@ int main(int argc, char **argv) {
         consoleUpdate(NULL);
     }
 
+    bool usb_host_ready = false;
     rc = ch340_init();
     if (R_FAILED(rc)) {
-        LOG_E("USB init failed: 0x%x", rc);
-        printf("\n  " CLR_RED "USB init failed: 0x%x" CLR_RST "\n", rc);
-        printf("  " CLR_DIM "Check OTG cable connection" CLR_RST "\n\n");
-        printf("  Press any key to exit...\n");
+        LOG_W("USB host unavailable at startup: 0x%x", rc);
+        printf("\n  " CLR_YEL "USB host unavailable: 0x%x" CLR_RST "\n", rc);
+        printf("  " CLR_DIM "Printer is offline. Plug it in and press [+] to retry." CLR_RST "\n\n");
         consoleUpdate(NULL);
-        while (appletMainLoop()) svcSleepThread(100000000ULL);
-        consoleExit(NULL);
-        logger_exit();
-        crash_exit();
-        socketExit();
-        return 0;
+    } else {
+        usb_host_ready = true;
     }
 
     size_t dev_sz = (sizeof(Ch340Device) + 0xFFF) & ~0xFFF;
@@ -304,22 +300,23 @@ int main(int argc, char **argv) {
     memset(printer, 0, sizeof(Ch340Device));
     mutexInit(&printer->mutex);
 
-    printf("\n  " CLR_YEL "Scanning for printer..." CLR_RST "\n");
-    consoleUpdate(NULL);
-
-    int retry = 0;
-    while (retry < USB_SCAN_RETRY_MAX && !printer->connected && appletMainLoop()) {
+    if (usb_host_ready) {
+        printf("\n  " CLR_YEL "Checking printer connection..." CLR_RST "\n");
+        consoleUpdate(NULL);
         rc = ch340_connect(printer);
         if (R_SUCCEEDED(rc)) {
             printf("  " CLR_GRN "Printer connected!" CLR_RST "\n");
             LOG_I("Printer connected via USB");
             httpd_start(printer);
-            break;
+        } else {
+            printf("  " CLR_DIM "Printer not connected. Press [+] after plugging it in." CLR_RST "\n");
+            LOG_W("Printer not connected at startup: 0x%x", rc);
         }
-        consoleUpdate(NULL);
-        svcSleepThread(UI_SCAN_INTERVAL_NS);
-        retry++;
+        svcSleepThread(600000000ULL);
+    } else {
+        LOG_W("Skipping startup printer scan because USB host is unavailable");
     }
+    consoleUpdate(NULL);
 
     // ============================================================
     // Phase 2: 主循环 (集成电源管理 + Applet 生命周期)
@@ -353,6 +350,18 @@ int main(int argc, char **argv) {
             consoleClear();
             printf("\n  " CLR_YEL "Re-scanning..." CLR_RST "\n");
             consoleUpdate(NULL);
+            if (!usb_host_ready) {
+                rc = ch340_init();
+                if (R_SUCCEEDED(rc)) {
+                    usb_host_ready = true;
+                    LOG_I("USB host initialized on manual retry");
+                } else {
+                    LOG_W("USB host still unavailable: 0x%x", rc);
+                    printf("  " CLR_DIM "USB host unavailable. Stay on this screen and retry later." CLR_RST "\n");
+                    consoleUpdate(NULL);
+                    continue;
+                }
+            }
             rc = ch340_connect(printer);
             if (R_SUCCEEDED(rc)) {
                 printf("  " CLR_GRN "Connected!" CLR_RST "\n");
@@ -367,8 +376,8 @@ int main(int argc, char **argv) {
         if ((down & HidNpadButton_Minus) && printer->connected) {
             LOG_I("Manual disconnect");
             gcode_cancel(printer);
-            httpd_stop();
             ch340_disconnect(printer);
+            httpd_start(NULL);
             power_print_end();
         }
 
