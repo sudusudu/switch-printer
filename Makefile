@@ -5,7 +5,7 @@ TARGET    := switch_printer
 BUILD     := build
 SRCDIR    := source
 AUTHOR    := switch-printer
-VERSION   := 1.1.0
+VERSION   := 1.2.0
 
 # ---- DEVKITPRO guard ----
 DEVKITPRO ?= /opt/devkitpro
@@ -26,7 +26,7 @@ LDFLAGS := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) \
            -Wl,--gc-sections
 LIBS    := -lnx -lm 
 
-SRCS := $(shell find $(SRCDIR) -name '*.c' 2>/dev/null || echo $(wildcard $(SRCDIR)/*.c))
+SRCS := $(filter-out $(SRCDIR)/gpu_render.c,$(shell find $(SRCDIR) -name '*.c' 2>/dev/null || echo $(wildcard $(SRCDIR)/*.c)))
 OBJS := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(SRCS))
 
 all: $(BUILD) $(BUILD)/$(TARGET).nro
