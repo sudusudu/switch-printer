@@ -85,13 +85,24 @@ const char *httpd_get_ip(void) { return g_ip_str; }
 static void send_response(int client, int code, const char *ctype, const char *body) {
     char hdr[512];
     int len = (int)strlen(body);
+    const char *reason = "Error";
+    switch (code) {
+        case 200: reason = "OK"; break;
+        case 400: reason = "Bad Request"; break;
+        case 401: reason = "Unauthorized"; break;
+        case 405: reason = "Method Not Allowed"; break;
+        case 409: reason = "Conflict"; break;
+        case 413: reason = "Payload Too Large"; break;
+        case 415: reason = "Unsupported Media Type"; break;
+        case 500: reason = "Internal Server Error"; break;
+        default: break;
+    }
     int n = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %d\r\n"
         "Connection: close\r\n\r\n",
-        code, code == 200 ? "OK" : code == 401 ? "Unauthorized" :
-              code == 413 ? "Payload Too Large" : code == 415 ? "Unsupported Media Type" : "Error",
+        code, reason,
         ctype, len);
     (void)send(client, hdr, n, 0);
     (void)send(client, body, len, 0);
@@ -206,11 +217,19 @@ static void handle_api(int client, Ch340Device *dev, char *method, char *path, c
         snprintf(api_buf, sizeof(api_buf), JSON_OK, "Homed");
     }
     else if (strcmp(path, "/api/pause") == 0) {
-        gcode_pause();
+        if (R_FAILED(gcode_pause())) {
+            snprintf(api_buf, sizeof(api_buf), JSON_ERR, "Printer is not printing");
+            send_response(client, 409, "application/json", api_buf);
+            return;
+        }
         snprintf(api_buf, sizeof(api_buf), JSON_OK, "Paused");
     }
     else if (strcmp(path, "/api/resume") == 0) {
-        gcode_resume();
+        if (R_FAILED(gcode_resume())) {
+            snprintf(api_buf, sizeof(api_buf), JSON_ERR, "Printer is not paused");
+            send_response(client, 409, "application/json", api_buf);
+            return;
+        }
         snprintf(api_buf, sizeof(api_buf), JSON_OK, "Resumed");
     }
     else if (strcmp(path, "/api/cancel") == 0) {
@@ -247,7 +266,12 @@ static void handle_api(int client, Ch340Device *dev, char *method, char *path, c
             send_response(client, 400, "application/json", api_buf);
             return;
         }
-        gcode_move(dev, dx, dy, dz, JOG_FEEDRATE);
+        Result rc = gcode_move(dev, dx, dy, dz, JOG_FEEDRATE);
+        if (R_FAILED(rc)) {
+            snprintf(api_buf, sizeof(api_buf), JSON_ERR, "Move rejected");
+            send_response(client, 409, "application/json", api_buf);
+            return;
+        }
         snprintf(api_buf, sizeof(api_buf), JSON_OK, "Moved");
     }
     else {
@@ -367,7 +391,15 @@ static void handle_upload(int client, char *req_buf, int first_recvd,
         return;
     }
 
-    rename(tmppath, filepath);
+    if (rename(tmppath, filepath) != 0) {
+        remove(filepath);
+        if (rename(tmppath, filepath) != 0) {
+            remove(tmppath);
+            snprintf(api_buf, sizeof(api_buf), JSON_ERR, "Cannot finalize upload");
+            send_response(client, 500, "application/json", api_buf);
+            return;
+        }
+    }
     svcSleepThread(50000000ULL);
 
     Result rc = gcode_start_print(g_printer, filepath);

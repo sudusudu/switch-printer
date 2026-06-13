@@ -284,16 +284,24 @@ Result gcode_start_print(Ch340Device *dev, const char *file_path) {
 }
 
 Result gcode_pause(void) {
-    atomic_store(&g_paused, true);
     mutexLock(&g_status_mutex);
+    if (g_status.state != PRINTER_PRINTING) {
+        mutexUnlock(&g_status_mutex);
+        return MAKERESULT(225, 4);
+    }
+    atomic_store(&g_paused, true);
     g_status.state = PRINTER_PAUSED;
     mutexUnlock(&g_status_mutex);
     return 0;
 }
 
 Result gcode_resume(void) {
-    atomic_store(&g_paused, false);
     mutexLock(&g_status_mutex);
+    if (g_status.state != PRINTER_PAUSED) {
+        mutexUnlock(&g_status_mutex);
+        return MAKERESULT(225, 4);
+    }
+    atomic_store(&g_paused, false);
     g_status.state = PRINTER_PRINTING;
     mutexUnlock(&g_status_mutex);
     return 0;
