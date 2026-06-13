@@ -540,7 +540,13 @@ Result httpd_start(Ch340Device *printer_dev) {
                              HTTPD_THREAD_STACK_SIZE, HTTPD_THREAD_PRIORITY, CORE_HTTP);
     if (R_FAILED(rc)) { g_running = false; return rc; }
     g_server_started = true;
-    threadStart(&g_server_thread);
+    rc = threadStart(&g_server_thread);
+    if (R_FAILED(rc)) {
+        threadClose(&g_server_thread);
+        g_server_started = false;
+        g_running = false;
+        return rc;
+    }
     return 0;
 }
 

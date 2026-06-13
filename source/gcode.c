@@ -243,6 +243,9 @@ Result gcode_start_print(Ch340Device *dev, const char *file_path) {
     if (!dev->connected) return MAKERESULT(Module_Libnx, 1);
     if (atomic_load(&g_thread_running)) return MAKERESULT(225, 1);
 
+    atomic_store(&g_cancel, false);
+    atomic_store(&g_paused, false);
+
     mutexLock(&g_status_mutex);
     if (g_status.state == PRINTER_PRINTING || g_status.state == PRINTER_PAUSED) {
         mutexUnlock(&g_status_mutex);
@@ -309,13 +312,15 @@ Result gcode_resume(void) {
 
 Result gcode_cancel(Ch340Device *dev) {
     (void)dev;
-    atomic_store(&g_cancel, true);
+    bool had_thread = atomic_load(&g_thread_created);
+    atomic_store(&g_cancel, had_thread);
     atomic_store(&g_paused, false);
-    if (atomic_load(&g_thread_created)) {
+    if (had_thread) {
         threadWaitForExit(&g_print_thread);
         threadClose(&g_print_thread);
         atomic_store(&g_thread_created, false);
     }
+    atomic_store(&g_cancel, false);
     atomic_store(&g_thread_running, false);
     return 0;
 }
