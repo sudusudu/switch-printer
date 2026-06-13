@@ -213,10 +213,13 @@ static void draw_ui(Ch340Device *dev) {
     printf("\xe2\x94\x98\n" CLR_RST);
 
     // WiFi / Web UI / Token 提示
-    if (wf && usb) {
+    if (wf) {
         printf("\n  " CLR_BOLD "Web UI \xe2\x86\x92 " CLR_CYAN "http://%s:%d" CLR_RST "\n", wifi_ip, HTTP_PORT);
         if (auth_token && auth_token[0]) {
             printf("  " CLR_BOLD "Token  \xe2\x86\x92 " CLR_YEL "%s" CLR_RST "\n", auth_token);
+        }
+        if (!usb) {
+            printf("  " CLR_DIM "Web UI is online; printer is offline until USB connects." CLR_RST "\n");
         }
     } else if (!usb) {
         printf("\n  " CLR_DIM "Press [+] to connect printer" CLR_RST "\n");

@@ -1,4 +1,5 @@
 #include "usb_ch340.h"
+#include "logger.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -71,8 +72,15 @@ Result ch340_connect(Ch340Device *dev) {
 
     s32 total = 0;
     Result rc = usbHsQueryAvailableInterfaces(NULL, NULL, 0, &total);
-    if (R_FAILED(rc)) return rc;
-    if (total == 0) return MAKERESULT(Module_Libnx, 4);
+    if (R_FAILED(rc)) {
+        LOG_E("usbHsQueryAvailableInterfaces(count) failed: 0x%x", rc);
+        return rc;
+    }
+    LOG_I("USB interface count: %d", total);
+    if (total == 0) {
+        LOG_W("No USB interfaces available");
+        return MAKERESULT(Module_Libnx, 4);
+    }
 
     UsbHsInterface interfaces[8];
     memset(interfaces, 0, sizeof(interfaces));
@@ -80,21 +88,36 @@ Result ch340_connect(Ch340Device *dev) {
     rc = usbHsQueryAvailableInterfaces(NULL, interfaces,
                                         (s32)(sizeof(interfaces) / sizeof(interfaces[0])),
                                         &found_count);
-    if (R_FAILED(rc)) return rc;
+    if (R_FAILED(rc)) {
+        LOG_E("usbHsQueryAvailableInterfaces(list) failed: 0x%x", rc);
+        return rc;
+    }
+    LOG_I("USB interfaces returned: %d", found_count);
 
     bool found = false;
     s32 found_index = -1;
     s32 limit = (found_count < 8) ? found_count : 8;
     for (s32 i = 0; i < limit; i++) {
+        LOG_I("USB[%d] VID=%04x PID=%04x", i,
+              interfaces[i].device_desc.idVendor,
+              interfaces[i].device_desc.idProduct);
         if (interfaces[i].device_desc.idVendor != CH340_VID ||
             interfaces[i].device_desc.idProduct != CH340_PID) continue;
         rc = usbHsAcquireUsbIf(&dev->if_session, &interfaces[i]);
         if (R_SUCCEEDED(rc)) { found = true; found_index = i; break; }
+        LOG_E("usbHsAcquireUsbIf failed for CH340 candidate %d: 0x%x", i, rc);
     }
-    if (!found) return MAKERESULT(Module_Libnx, 4);
+    if (!found) {
+        LOG_W("CH340 VID=%04x PID=%04x not found", CH340_VID, CH340_PID);
+        return MAKERESULT(Module_Libnx, 4);
+    }
+    LOG_I("CH340 interface acquired at index %d", found_index);
 
     rc = ch340_init_chip(dev);
-    if (R_FAILED(rc)) goto fail;
+    if (R_FAILED(rc)) {
+        LOG_E("CH340 init chip failed: 0x%x", rc);
+        goto fail;
+    }
 
     // 使用 sizeof 而非硬编码 15 遍历端点描述符数组
     struct usb_endpoint_descriptor *out_desc = NULL;
@@ -112,29 +135,41 @@ Result ch340_connect(Ch340Device *dev) {
     }
 
     if (out_desc) {
+        LOG_I("CH340 OUT endpoint: 0x%02x", out_desc->bEndpointAddress);
         rc = usbHsIfOpenUsbEp(&dev->if_session, &dev->ep_out, 8, CH340_BUF_SIZE, out_desc);
     } else {
+        LOG_W("CH340 OUT endpoint descriptor missing; using fallback 0x02");
         struct usb_endpoint_descriptor fake_out = {0};
         fake_out.bLength = 7; fake_out.bDescriptorType = 5;
         fake_out.bEndpointAddress = 0x02; fake_out.bmAttributes = 2; fake_out.wMaxPacketSize = 64;
         rc = usbHsIfOpenUsbEp(&dev->if_session, &dev->ep_out, 8, CH340_BUF_SIZE, &fake_out);
     }
-    if (R_FAILED(rc)) goto fail;
+    if (R_FAILED(rc)) {
+        LOG_E("Open CH340 OUT endpoint failed: 0x%x", rc);
+        goto fail;
+    }
 
     if (in_desc) {
+        LOG_I("CH340 IN endpoint: 0x%02x", in_desc->bEndpointAddress);
         rc = usbHsIfOpenUsbEp(&dev->if_session, &dev->ep_in, 8, CH340_BUF_SIZE, in_desc);
     } else {
+        LOG_W("CH340 IN endpoint descriptor missing; using fallback 0x82");
         struct usb_endpoint_descriptor fake_in = {0};
         fake_in.bLength = 7; fake_in.bDescriptorType = 5;
         fake_in.bEndpointAddress = 0x82; fake_in.bmAttributes = 2; fake_in.wMaxPacketSize = 64;
         rc = usbHsIfOpenUsbEp(&dev->if_session, &dev->ep_in, 8, CH340_BUF_SIZE, &fake_in);
     }
-    if (R_FAILED(rc)) { usbHsEpClose(&dev->ep_out); goto fail; }
+    if (R_FAILED(rc)) {
+        LOG_E("Open CH340 IN endpoint failed: 0x%x", rc);
+        usbHsEpClose(&dev->ep_out);
+        goto fail;
+    }
 
     // P0: set connected inside mutex (MOW-004, SEC-005 TOCTOU)
     mutexLock(&dev->mutex);
     dev->connected = true;
     mutexUnlock(&dev->mutex);
+    LOG_I("CH340 connected");
     return 0;
 
 fail:
